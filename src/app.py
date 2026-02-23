@@ -91,7 +91,7 @@ from .reconciliation import (
     reconciliation_table,
 )
 from .tables import build_four_tables, build_monthly_starting_portfolio_value_table
-from .ticker_characteristics import resolve_ticker_characteristics
+from .ticker_characteristics import infer_industry_bucket, infer_style_bucket, resolve_ticker_characteristics
 
 
 MANUAL_MONTHLY_TRACKED_VALUES_RAW: list[tuple[str, str]] = [
@@ -1188,9 +1188,40 @@ def holding_category_overrides_editor(
             f"Updated ticker characteristics: appended {appended_count} new instrument(s) to "
             "`ticker_classifications.csv` with `t.b.d.` placeholders."
         )
+    base["style"] = base["style"].fillna("").astype(str).str.strip()
+    base["industry"] = base["industry"].fillna("").astype(str).str.strip()
+    base["auto_style"] = base["auto_style"].fillna("").astype(str).str.strip()
+    base["auto_industry"] = base["auto_industry"].fillna("").astype(str).str.strip()
+    base["style"] = np.where(base["style"].astype(str).str.strip().eq(""), base["auto_style"], base["style"])
+    base["industry"] = np.where(base["industry"].astype(str).str.strip().eq(""), base["auto_industry"], base["industry"])
+
+    default_override_map: dict[str, dict[str, str]] = {}
+    legacy_inferred_map: dict[str, dict[str, str]] = {}
+    for row in base.itertuples(index=False):
+        key = str(getattr(row, "instrument_id", "")).strip()
+        if key == "":
+            continue
+        product = str(getattr(row, "product", "")).strip()
+        ticker = str(getattr(row, "ticker", "")).strip()
+        is_etf = bool(getattr(row, "is_etf", False))
+        default_override_map[key] = {
+            "style": str(getattr(row, "style", "")).strip(),
+            "industry": str(getattr(row, "industry", "")).strip(),
+        }
+        legacy_inferred_map[key] = {
+            "style": infer_style_bucket(product=product, ticker=ticker, is_etf=is_etf),
+            "industry": infer_industry_bucket(product=product, ticker=ticker, is_etf=is_etf),
+        }
+    st.session_state["holding_override_editor_default_map"] = default_override_map
+
     base = base[["instrument_id", "ticker", "product", "auto_style", "style", "auto_industry", "industry"]].copy()
 
-    seed_sig = tuple(base["instrument_id"].astype(str).tolist())
+    seed_sig = tuple(
+        base[["instrument_id", "style", "industry"]]
+        .fillna("")
+        .astype(str)
+        .itertuples(index=False, name=None)
+    )
     if st.session_state.get("holding_override_editor_sig") != seed_sig:
         prev_df = st.session_state.get("holding_override_editor_df")
         prev_map: dict[str, dict[str, str]] = {}
@@ -1204,15 +1235,43 @@ def holding_category_overrides_editor(
                     "industry": str(getattr(row, "industry", "")).strip(),
                 }
         loaded_overrides = st.session_state.pop("loaded_holding_category_overrides", None)
+        stale_loaded_fields = 0
         if isinstance(loaded_overrides, dict):
             for instrument_id, entry in loaded_overrides.items():
                 key = str(instrument_id).strip()
                 if key == "" or not isinstance(entry, dict):
                     continue
-                prev_map[key] = {
-                    "style": str(entry.get("style", "")).strip(),
-                    "industry": str(entry.get("industry", "")).strip(),
-                }
+                default_entry = default_override_map.get(key, {})
+                legacy_entry = legacy_inferred_map.get(key, {})
+                loaded_style = str(entry.get("style", "")).strip()
+                loaded_industry = str(entry.get("industry", "")).strip()
+                keep_style = loaded_style
+                keep_industry = loaded_industry
+                if (
+                    loaded_style != ""
+                    and loaded_style == str(legacy_entry.get("style", ""))
+                    and loaded_style != str(default_entry.get("style", ""))
+                ):
+                    keep_style = ""
+                    stale_loaded_fields += 1
+                if (
+                    loaded_industry != ""
+                    and loaded_industry == str(legacy_entry.get("industry", ""))
+                    and loaded_industry != str(default_entry.get("industry", ""))
+                ):
+                    keep_industry = ""
+                    stale_loaded_fields += 1
+                if key not in prev_map:
+                    prev_map[key] = {}
+                if keep_style != "":
+                    prev_map[key]["style"] = keep_style
+                if keep_industry != "":
+                    prev_map[key]["industry"] = keep_industry
+        if stale_loaded_fields > 0:
+            st.caption(
+                f"Ignored {stale_loaded_fields} legacy auto override value(s) from the saved strategy so "
+                "CSV classifications are shown in Section 6."
+            )
         default_style = base["style"].fillna("").astype(str)
         default_industry = base["industry"].fillna("").astype(str)
         base["style"] = base["instrument_id"].map(
@@ -1295,6 +1354,7 @@ def holding_category_overrides_editor(
         st.session_state["holding_override_editor_df"] = edited
     out: dict[str, dict[str, str]] = {}
     final_df = st.session_state.get("holding_override_editor_df", pd.DataFrame())
+    default_override_map = st.session_state.get("holding_override_editor_default_map", {})
     if isinstance(final_df, pd.DataFrame):
         for row in final_df.itertuples(index=False):
             instrument_id = str(getattr(row, "instrument_id", "")).strip()
@@ -1302,10 +1362,17 @@ def holding_category_overrides_editor(
                 continue
             style = str(getattr(row, "style", "")).strip()
             industry = str(getattr(row, "industry", "")).strip()
+            default_entry = (
+                default_override_map.get(instrument_id, {})
+                if isinstance(default_override_map, dict)
+                else {}
+            )
+            default_style = str(default_entry.get("style", "")).strip()
+            default_industry = str(default_entry.get("industry", "")).strip()
             entry: dict[str, str] = {}
-            if style:
+            if style and style != default_style:
                 entry["style"] = style
-            if industry:
+            if industry and industry != default_industry:
                 entry["industry"] = industry
             if entry:
                 out[instrument_id] = entry
