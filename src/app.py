@@ -91,6 +91,7 @@ from .reconciliation import (
     reconciliation_table,
 )
 from .tables import build_four_tables, build_monthly_starting_portfolio_value_table
+from .ticker_characteristics import resolve_ticker_characteristics
 
 
 MANUAL_MONTHLY_TRACKED_VALUES_RAW: list[tuple[str, str]] = [
@@ -1158,15 +1159,12 @@ def holding_category_overrides_editor(
             product = str(getattr(item, "product", "")).strip()
             ticker = str(getattr(item, "ticker", "")).strip()
             is_etf = bool(getattr(item, "is_etf", False))
-            auto_style = _infer_style_bucket_local(product=product, ticker=ticker, is_etf=is_etf)
-            auto_industry = _infer_industry_bucket_local(product=product, ticker=ticker, is_etf=is_etf)
             instruments_rows.append(
                 {
                     "instrument_id": instrument_id,
                     "product": product,
                     "ticker": ticker,
-                    "auto_style": auto_style,
-                    "auto_industry": auto_industry,
+                    "is_etf": is_etf,
                 }
             )
     if not instruments_rows:
@@ -1179,6 +1177,19 @@ def holding_category_overrides_editor(
         .sort_values("product")
         .reset_index(drop=True)
     )
+    base, characteristics_stats = resolve_ticker_characteristics(
+        instruments_df=base,
+        ticker_classifications_path=Path("ticker_classifications.csv"),
+        auto_append_missing=True,
+    )
+    appended_count = int(characteristics_stats.get("appended_count", 0))
+    if appended_count > 0:
+        st.caption(
+            f"Updated ticker characteristics: appended {appended_count} new instrument(s) to "
+            "`ticker_classifications.csv` with `t.b.d.` placeholders."
+        )
+    base = base[["instrument_id", "ticker", "product", "auto_style", "style", "auto_industry", "industry"]].copy()
+
     seed_sig = tuple(base["instrument_id"].astype(str).tolist())
     if st.session_state.get("holding_override_editor_sig") != seed_sig:
         prev_df = st.session_state.get("holding_override_editor_df")
@@ -1202,11 +1213,19 @@ def holding_category_overrides_editor(
                     "style": str(entry.get("style", "")).strip(),
                     "industry": str(entry.get("industry", "")).strip(),
                 }
+        default_style = base["style"].fillna("").astype(str)
+        default_industry = base["industry"].fillna("").astype(str)
         base["style"] = base["instrument_id"].map(
             lambda k: prev_map.get(str(k), {}).get("style", "")
         )
         base["industry"] = base["instrument_id"].map(
             lambda k: prev_map.get(str(k), {}).get("industry", "")
+        )
+        base["style"] = np.where(base["style"].astype(str).str.strip().eq(""), default_style, base["style"])
+        base["industry"] = np.where(
+            base["industry"].astype(str).str.strip().eq(""),
+            default_industry,
+            base["industry"],
         )
         base["style"] = np.where(base["style"].astype(str).str.strip().eq(""), base["auto_style"], base["style"])
         base["industry"] = np.where(
@@ -1291,42 +1310,6 @@ def holding_category_overrides_editor(
             if entry:
                 out[instrument_id] = entry
     return out
-
-
-def _infer_industry_bucket_local(*, product: str, ticker: str, is_etf: bool) -> str:
-    txt = f"{product} {ticker}".upper()
-    rules = [
-        ("Technology", ["TECH", "SOFTWARE", "SEMICON", "CHIP", "CLOUD", "CYBER", "NASDAQ"]),
-        ("Financials", ["BANK", "FINAN", "INSUR", "PAYMENT", "CAPITAL"]),
-        ("Healthcare", ["HEALTH", "PHARMA", "BIOTECH", "MEDIC", "THERAP"]),
-        ("Consumer", ["CONSUM", "RETAIL", "FOOD", "BEVERAGE", "LUXURY", "APPAREL"]),
-        ("Industrials", ["INDUSTR", "AEROSPACE", "DEFEN", "TRANSPORT", "LOGISTICS"]),
-        ("Energy", ["ENERGY", "OIL", "GAS", "SOLAR", "WIND", "UTILIT"]),
-        ("Materials", ["MINING", "METAL", "STEEL", "CHEMICAL", "MATERIAL"]),
-        ("Real Estate", ["REAL ESTATE", "REIT", "PROPERTY"]),
-        ("Communication", ["TELECOM", "MEDIA", "COMMUNICATION", "INTERNET"]),
-    ]
-    for name, keywords in rules:
-        if any(k in txt for k in keywords):
-            return name
-    if is_etf:
-        if any(k in txt for k in ["MSCI", "S&P", "STOXX", "WORLD", "ALL-WORLD", "ACWI"]):
-            return "Broad-market ETF"
-        return "ETF (other)"
-    return "Unclassified"
-
-
-def _infer_style_bucket_local(*, product: str, ticker: str, is_etf: bool) -> str:
-    txt = f"{product} {ticker}".upper()
-    if any(k in txt for k in ["DIVIDEND", "ARISTOCRAT", "INCOME", "YIELD"]):
-        return "Dividend"
-    if any(k in txt for k in ["VALUE", "QUALITY VALUE", "DEEP VALUE"]):
-        return "Value"
-    if any(k in txt for k in ["GROWTH", "NASDAQ", "TECH", "INNOVATION", "MOMENTUM"]):
-        return "Growth"
-    if is_etf and any(k in txt for k in ["MSCI", "S&P", "WORLD", "STOXX", "ACWI"]):
-        return "Blend"
-    return "Unclassified"
 
 
 def build_benchmark_bundle(
@@ -1648,6 +1631,8 @@ def process_loaded_datasets(
             "holding_category_overrides": params.get("holding_category_overrides", {}),
         },
         prices_eur=ts_result.prices_eur,
+        ticker_classifications_path=Path("ticker_classifications.csv"),
+        auto_append_ticker_characteristics=True,
     )
     benchmark_bundle = build_benchmark_bundle(
         metrics_index=ts_result.metrics.index,

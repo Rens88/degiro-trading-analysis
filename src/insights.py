@@ -19,10 +19,13 @@ When editing:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from .ticker_characteristics import resolve_ticker_characteristics
 
 
 def build_ai_generated_insights(
@@ -120,6 +123,8 @@ def build_ai_spread_analysis(
     cash_detail_df: pd.DataFrame,
     strategy: dict[str, Any],
     prices_eur: pd.DataFrame | None = None,
+    ticker_classifications_path: Path | str | None = None,
+    auto_append_ticker_characteristics: bool = False,
 ) -> dict[str, Any]:
     """
     Build spread/concentration diagnostics and action plans.
@@ -163,22 +168,22 @@ def build_ai_spread_analysis(
         strategy.get("holding_category_overrides")
     )
 
-    holdings["industry"] = holdings.apply(
-        lambda row: _infer_industry_bucket(
-            product=str(row.get("product", "")),
-            ticker=str(row.get("ticker", "")),
-            is_etf=bool(row.get("is_etf", False)),
-        ),
-        axis=1,
+    resolved_characteristics, _ = resolve_ticker_characteristics(
+        instruments_df=holdings,
+        ticker_classifications_path=ticker_classifications_path,
+        auto_append_missing=bool(auto_append_ticker_characteristics),
     )
-    holdings["style"] = holdings.apply(
-        lambda row: _infer_style_bucket(
-            product=str(row.get("product", "")),
-            ticker=str(row.get("ticker", "")),
-            is_etf=bool(row.get("is_etf", False)),
-        ),
-        axis=1,
-    )
+    style_series = pd.Series("", index=holdings.index, dtype="object")
+    industry_series = pd.Series("", index=holdings.index, dtype="object")
+    if isinstance(resolved_characteristics, pd.DataFrame) and not resolved_characteristics.empty:
+        if "style" in resolved_characteristics.columns:
+            style_series = resolved_characteristics["style"]
+        if "industry" in resolved_characteristics.columns:
+            industry_series = resolved_characteristics["industry"]
+    holdings["style"] = style_series.fillna("").astype(str).str.strip()
+    holdings["industry"] = industry_series.fillna("").astype(str).str.strip()
+    holdings["style"] = holdings["style"].replace("", "Unclassified")
+    holdings["industry"] = holdings["industry"].replace("", "Unclassified")
     holdings = _apply_holding_category_overrides(
         holdings=holdings,
         overrides=holding_category_overrides,
@@ -1529,14 +1534,7 @@ def _build_industry_allocation_df(*, holdings: pd.DataFrame, total_value: float)
         return pd.DataFrame(columns=["industry", "value_eur", "pct_total", "holding_count"])
     out = holdings.copy()
     if "industry" not in out.columns:
-        out["industry"] = out.apply(
-            lambda row: _infer_industry_bucket(
-                product=str(row.get("product", "")),
-                ticker=str(row.get("ticker", "")),
-                is_etf=bool(row.get("is_etf", False)),
-            ),
-            axis=1,
-        )
+        out["industry"] = "Unclassified"
     out["industry"] = out["industry"].fillna("Unclassified").astype(str).str.strip().replace("", "Unclassified")
     grouped = (
         out.groupby("industry", dropna=False)
@@ -1555,14 +1553,7 @@ def _build_style_allocation_df(*, holdings: pd.DataFrame, total_value: float) ->
         return pd.DataFrame(columns=["style", "value_eur", "pct_total", "holding_count"])
     out = holdings.copy()
     if "style" not in out.columns:
-        out["style"] = out.apply(
-            lambda row: _infer_style_bucket(
-                product=str(row.get("product", "")),
-                ticker=str(row.get("ticker", "")),
-                is_etf=bool(row.get("is_etf", False)),
-            ),
-            axis=1,
-        )
+        out["style"] = "Unclassified"
     out["style"] = out["style"].fillna("Unclassified").astype(str).str.strip().replace("", "Unclassified")
     grouped = (
         out.groupby("style", dropna=False)
@@ -1789,42 +1780,6 @@ def _compute_high_correlation_pairs(
         return pd.DataFrame()
     out = pd.DataFrame(rows).sort_values(["correlation", "combined_weight_pct"], ascending=False)
     return out.reset_index(drop=True)
-
-
-def _infer_industry_bucket(*, product: str, ticker: str, is_etf: bool) -> str:
-    txt = f"{product} {ticker}".upper()
-    rules = [
-        ("Technology", ["TECH", "SOFTWARE", "SEMICON", "CHIP", "CLOUD", "CYBER", "NASDAQ"]),
-        ("Financials", ["BANK", "FINAN", "INSUR", "PAYMENT", "CAPITAL"]),
-        ("Healthcare", ["HEALTH", "PHARMA", "BIOTECH", "MEDIC", "THERAP"]),
-        ("Consumer", ["CONSUM", "RETAIL", "FOOD", "BEVERAGE", "LUXURY", "APPAREL"]),
-        ("Industrials", ["INDUSTR", "AEROSPACE", "DEFEN", "TRANSPORT", "LOGISTICS"]),
-        ("Energy", ["ENERGY", "OIL", "GAS", "SOLAR", "WIND", "UTILIT"]),
-        ("Materials", ["MINING", "METAL", "STEEL", "CHEMICAL", "MATERIAL"]),
-        ("Real Estate", ["REAL ESTATE", "REIT", "PROPERTY"]),
-        ("Communication", ["TELECOM", "MEDIA", "COMMUNICATION", "INTERNET"]),
-    ]
-    for name, keywords in rules:
-        if any(k in txt for k in keywords):
-            return name
-    if is_etf:
-        if any(k in txt for k in ["MSCI", "S&P", "STOXX", "WORLD", "ALL-WORLD", "ACWI"]):
-            return "Broad-market ETF"
-        return "ETF (other)"
-    return "Unclassified"
-
-
-def _infer_style_bucket(*, product: str, ticker: str, is_etf: bool) -> str:
-    txt = f"{product} {ticker}".upper()
-    if any(k in txt for k in ["DIVIDEND", "ARISTOCRAT", "INCOME", "YIELD"]):
-        return "Dividend"
-    if any(k in txt for k in ["VALUE", "QUALITY VALUE", "DEEP VALUE"]):
-        return "Value"
-    if any(k in txt for k in ["GROWTH", "NASDAQ", "TECH", "INNOVATION", "MOMENTUM"]):
-        return "Growth"
-    if is_etf and any(k in txt for k in ["MSCI", "S&P", "WORLD", "STOXX", "ACWI"]):
-        return "Blend"
-    return "Unclassified"
 
 
 def _pct(value: float, total: float) -> float:

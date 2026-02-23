@@ -163,6 +163,7 @@ def test_spread_analysis_outputs_style_and_next_steps() -> None:
             "holding_category_overrides": {},
         },
         prices_eur=prices,
+        auto_append_ticker_characteristics=False,
     )
     assert "style_allocation_df" in out
     assert "what_to_do_next_df" in out
@@ -171,6 +172,67 @@ def test_spread_analysis_outputs_style_and_next_steps() -> None:
     checks = out["strategy_checks_df"]
     holdings_row = checks.loc[checks["metric"] == "Total non-cash holdings (count)"].iloc[0]
     assert float(holdings_row["actual"]) == 2.0
+
+
+def test_spread_analysis_uses_csv_characteristics_and_manual_overrides(tmp_path) -> None:
+    csv_path = tmp_path / "ticker_classifications.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "instrument_id,ticker,product,auto_style,style,auto_industry,industry,classification_description,classification_source",
+                "ID_MATCH,IDTKR,Instrument by id,Unclassified,CSV Style ID,Unclassified,CSV Industry ID,desc,source",
+                "ANOTHER_ID,TKR_FALLBACK,Instrument by ticker,Unclassified,CSV Style Ticker,Unclassified,CSV Industry Ticker,desc,source",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    holdings = pd.DataFrame(
+        {
+            "instrument_id": ["ID_MATCH", "UNLISTED_ID"],
+            "product": ["First product", "Second product"],
+            "ticker": ["DIFFERENT_TICKER", "TKR_FALLBACK"],
+            "currency": ["EUR", "USD"],
+            "is_etf": [False, False],
+            "quantity": [5.0, 3.0],
+            "value_eur": [1000.0, 500.0],
+        }
+    )
+    out = build_ai_spread_analysis(
+        holdings_df=holdings,
+        total_value_eur=1500.0,
+        cash_value_eur=0.0,
+        cash_detail_df=pd.DataFrame(),
+        strategy={
+            "target_etf_fraction": 0.5,
+            "desired_etf_holdings": 2,
+            "desired_non_etf_holdings": 3,
+            "target_cash_pct": 5.0,
+            "max_single_holding_pct": 80.0,
+            "max_top5_holdings_pct": 95.0,
+            "max_single_currency_pct": 90.0,
+            "max_single_industry_pct": 90.0,
+            "max_pair_correlation": 0.90,
+            "min_total_holdings": 2,
+            "min_over_value_eur": 10.0,
+            "target_currency_pct": {},
+            "target_industry_pct": {},
+            "target_style_pct": {},
+            "holding_category_overrides": {"ID_MATCH": {"style": "Manual Style", "industry": "Manual Industry"}},
+        },
+        prices_eur=pd.DataFrame(),
+        ticker_classifications_path=csv_path,
+        auto_append_ticker_characteristics=False,
+    )
+
+    concentration = out["concentration_df"]
+    row_id = concentration.loc[concentration["product"] == "First product"].iloc[0]
+    assert str(row_id["style"]) == "Manual Style"
+    assert str(row_id["industry"]) == "Manual Industry"
+
+    row_ticker = concentration.loc[concentration["product"] == "Second product"].iloc[0]
+    assert str(row_ticker["style"]) == "CSV Style Ticker"
+    assert str(row_ticker["industry"]) == "CSV Industry Ticker"
 
 
 def test_irr_helpers_do_not_emit_runtime_warnings_for_extreme_brackets() -> None:
