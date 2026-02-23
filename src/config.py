@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+# Required DEGIRO export files for each dataset.
+REQUIRED_DATASET_FILES = ("Transactions.csv", "Portfolio.csv", "Account.csv")
+
+# Bundled sample datasets.
+SAMPLE_DATASETS = {
+    "pensioenbeleggen": Path("data/pensioenbeleggen"),
+    "spaarbeleggen": Path("data/spaarbeleggen"),
+    "pensioenbeleggen_fixed": Path("data/pensioenbeleggen_fixed"),
+    "spaarbeleggen_fixed": Path("data/spaarbeleggen_fixed"),
+    "pensioenbeleggen_broken": Path("data/pensioenbeleggen_broken"),
+    "spaarbeleggen_broken": Path("data/spaarbeleggen_broken"),
+}
+
+# FSM state names.
+STATE_LOADING_DATA = "STATE_LOADING_DATA"
+STATE_SELECTING_PARAMS = "STATE_SELECTING_PARAMS"
+STATE_PROCESSING = "STATE_PROCESSING"
+STATE_VIEWING_RESULTS = "STATE_VIEWING_RESULTS"
+STATE_EXPORTING = "STATE_EXPORTING"
+STATE_RELOADING_EXPORT = "STATE_RELOADING_EXPORT"
+
+STATE_ORDER = [
+    STATE_LOADING_DATA,
+    STATE_SELECTING_PARAMS,
+    STATE_PROCESSING,
+    STATE_VIEWING_RESULTS,
+    STATE_EXPORTING,
+    STATE_RELOADING_EXPORT,
+]
+
+# Plot colors.
+BASE_BLUE = "#01378A"
+BASE_RED = "#E1011A"
+BASE_ORANGE = "#EA6D08"
+BASE_YELLOW = "#F4C300"
+BASE_GREEN = "#009F3D"
+
+# Defaults.
+DEFAULT_LOOKBACK_MONTHS = 24
+DEFAULT_MEDIAN_WINDOW_MONTHS = 6
+DEFAULT_TARGET_ETF_FRACTION = 0.50
+DEFAULT_MIN_OVER_VALUE_EUR = 400.0
+DEFAULT_DESIRED_ETF_HOLDINGS = 4
+DEFAULT_DESIRED_NON_ETF_HOLDINGS = 12
+DEFAULT_TARGET_CASH_PCT = 10.0
+DEFAULT_MAX_SINGLE_HOLDING_PCT = 12.0
+DEFAULT_MAX_TOP5_HOLDINGS_PCT = 55.0
+DEFAULT_MAX_SINGLE_CURRENCY_PCT = 65.0
+DEFAULT_MAX_SINGLE_INDUSTRY_PCT = 35.0
+DEFAULT_MIN_TOTAL_HOLDINGS = 12
+DEFAULT_STRATEGY_FILE_PATH = Path("strategy/spread_strategy.json")
+DEFAULT_STRATEGY_DATASET_A_DIR = Path("data/pensioenbeleggen")
+DEFAULT_STRATEGY_DATASET_B_DIR = Path("data/spaarbeleggen")
+
+# Fallback ETF list from legacy project.
+DEFAULT_ETF_ISINS = {
+    "IE00B0M63284",
+    "IE00B1XNHC34",
+    "IE00B4L5Y983",
+    "IE00B5M1WJ87",
+    "NL0010408704",
+    "IE00BKY58G26",
+    "IE00B3XXRP09",
+    "FR0000021842",
+}

@@ -285,8 +285,14 @@ Defaults (if user does not specify)
 - Hiding raw data when filters are ON (must show raw, transparent).
 - Placing logic in `app.py` that belongs in processing modules.
 
-## Future: packaging and run scripts
-Do not generate these files automatically now. Use the following content when requested.
+## Packaging and launch scripts
+For every new dashboard scaffold, always generate a Windows launcher file `run_app.bat`.
+The launcher must:
+- robustly detect Python 3 (`.venv` python first, then `python` on PATH, then `py -3`)
+- create and activate `.venv`
+- install `requirements.txt`
+- run the app
+- always pause before exiting (both success and failure), so users can read output.
 
 Typical `requirements.txt`
 ```
@@ -303,53 +309,133 @@ openpyxl
 `run_app.bat` (Windows)
 ```bat
 @echo off
-setlocal
+setlocal EnableExtensions
 
-echo Locating Python...
+set "FAIL_STEP="
+set "APP_EXIT=0"
 set "ROOT=%~dp0"
-cd /d "%ROOT%" || goto :cd_error
+set "SCRIPT=%~f0"
 
+echo ============================================================
+echo Streamlit launcher
+echo Script : "%SCRIPT%"
+echo Folder : "%ROOT%"
+echo Started: %DATE% %TIME%
+echo ============================================================
+echo.
+
+echo [STEP] Change directory to app folder...
+cd /d "%ROOT%"
+if errorlevel 1 goto :cd_error
+echo [OK] Working directory: "%CD%"
+echo.
+
+echo [STEP] Detect Python 3...
 set "PYTHON="
-py -3 -c "import sys" >nul 2>&1
-if %errorlevel%==0 (
-    set "PYTHON=py -3"
+if exist ".venv\Scripts\python.exe" (
+    set "PYTHON=.venv\Scripts\python.exe"
+    echo [OK] Found project venv Python: ".venv\Scripts\python.exe"
 ) else (
-    python -c "import sys" >nul 2>&1
-    if %errorlevel%==0 (
+    where python >nul 2>&1
+    if not errorlevel 1 (
         set "PYTHON=python"
+        echo [OK] Using Python from PATH: python
     ) else (
-        echo Python 3 is required but was not found. Please install Python 3.x and try again.
+        py -3 -c "import sys" >nul 2>&1
+        if not errorlevel 1 (
+            set "PYTHON=py -3"
+            echo [OK] Using Python launcher: py -3
+        ) else (
+            set "FAIL_STEP=detect_python"
+            echo [ERROR] Could not find Python 3.
+            goto :fail
+        )
+    )
+)
+if not defined PYTHON (
+    set "FAIL_STEP=detect_python"
+    goto :fail
+)
+%PYTHON% -c "import sys; print('[DEBUG] Executable:', sys.executable); print('[DEBUG] Version   :', sys.version.splitlines()[0])"
+if errorlevel 1 (
+    set "FAIL_STEP=python_details"
+    goto :fail
+)
+echo.
+
+echo [STEP] Ensure virtual environment exists...
+if not exist ".venv\Scripts\python.exe" (
+    echo [INFO] .venv not found, creating it...
+    %PYTHON% -m venv ".venv"
+    if errorlevel 1 (
+        set "FAIL_STEP=create_venv"
         goto :fail
     )
 )
+echo.
 
-if not exist ".venv\\Scripts\\python.exe" (
-    echo Creating virtual environment in .venv (could take a minute)...
-    %PYTHON% -m venv ".venv" || goto :fail
+echo [STEP] Activate virtual environment...
+call ".venv\Scripts\activate.bat"
+if errorlevel 1 (
+    set "FAIL_STEP=activate_venv"
+    goto :fail
 )
+where python
+python --version
+if errorlevel 1 (
+    set "FAIL_STEP=verify_active_python"
+    goto :fail
+)
+echo.
 
-call ".venv\\Scripts\\activate.bat" || goto :fail
+echo [STEP] Install requirements...
+if not exist "requirements.txt" (
+    set "FAIL_STEP=requirements_missing"
+    goto :fail
+)
+python -m pip install -r requirements.txt --quiet
+if errorlevel 1 (
+    set "FAIL_STEP=pip_install"
+    goto :fail
+)
+echo.
 
-echo Installing requirements (will take about 5 mins first time, internet required)...
-python -m pip install -r requirements.txt --quiet || goto :fail
-
-echo Starting Streamlit app...
+echo [STEP] Start Streamlit app...
 python -m streamlit run src/app.py
-if %errorlevel% neq 0 goto :fail
-
-endlocal
-goto :eof
+set "APP_EXIT=%errorlevel%"
+if not "%APP_EXIT%"=="0" (
+    set "FAIL_STEP=run_streamlit"
+    goto :fail_with_code
+)
+echo [OK] Launcher completed without reported errors.
+goto :final_pause
 
 :cd_error
-echo ERROR: Could not change directory to the app folder.
-goto :pause_fail
+set "FAIL_STEP=cd_project_root"
+echo [ERROR] Could not change directory to "%ROOT%".
+goto :fail
+
+:fail_with_code
+echo [ERROR] Step "%FAIL_STEP%" failed with exit code %APP_EXIT%.
+goto :fail_footer
 
 :fail
+echo [ERROR] Step "%FAIL_STEP%" failed.
+:fail_footer
 echo.
-echo ERROR: Something went wrong. Try deleting the .venv folder and double-clicking again.
-:pause_fail
+echo Troubleshooting:
+echo  1. Delete ".venv" and run again.
+echo  2. Ensure internet is available for pip install.
+echo  3. Ensure Python 3 is installed and accessible as "python" or "py -3".
+
+:final_pause
 echo.
-pause
+echo Finished: %DATE% %TIME%
+echo Press any key to close this window...
+pause >nul
+
+endlocal
+exit /b
 ```
 
 `run_app.command` (macOS)
@@ -394,6 +480,7 @@ python -m streamlit run src/app.py
 
 ## Checklist for a new dashboard
 - [ ] Create folders `assets/` and `src/` with the required files.
+- [ ] Create `run_app.bat` with robust Python detection and an unconditional final pause before exit.
 - [ ] Define defaults and schema in `schema.py`.
 - [ ] Implement upload parsing + normalization in `read_data.py`.
 - [ ] Implement preprocessing helpers in `preprocessing.py`.

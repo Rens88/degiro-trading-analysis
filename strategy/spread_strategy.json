@@ -1,0 +1,21 @@
+{
+  "data_sources": {
+    "dataset_a_dir": "data\\pensioenbeleggen",
+    "dataset_b_dir": "data\\spaarbeleggen",
+    "mappings_path": "mappings.yml"
+  },
+  "saved_at": "2026-02-20T20:40:35",
+  "strategy": {
+    "desired_etf_holdings": 4,
+    "desired_non_etf_holdings": 12,
+    "max_single_currency_pct": 65.0,
+    "max_single_holding_pct": 12.0,
+    "max_single_industry_pct": 35.0,
+    "max_top5_holdings_pct": 55.0,
+    "min_over_value_eur": 400.0,
+    "min_total_holdings": 12,
+    "target_cash_pct": 5.0,
+    "target_etf_fraction": 0.5
+  },
+  "version": 1
+}

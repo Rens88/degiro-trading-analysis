@@ -1,0 +1,1 @@
+"""DEGIRO trading analysis package."""
