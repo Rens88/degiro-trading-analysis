@@ -1,3 +1,17 @@
+"""
+AGENT_NOTE: DEGIRO CSV ingestion and normalization.
+
+Interdependencies:
+- Produces `LoadedDataset` consumed by `src/app.py` and `src/strategy_check.py`.
+- Normalized column names are assumed by `src/reconciliation.py`,
+  `src/portfolio_timeseries.py`, `src/tables.py`, and `src/insights.py`.
+
+When editing:
+- Treat normalized column names/types as a shared schema.
+- If you rename columns here, review all downstream modules and tests.
+- See `src/INTERDEPENDENCIES.md` for dependency checklist.
+"""
+
 from __future__ import annotations
 
 import csv

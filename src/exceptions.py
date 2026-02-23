@@ -1,3 +1,11 @@
+"""
+AGENT_NOTE: Shared user-facing exception contract.
+
+Interdependencies:
+- Raised across pipeline modules and rendered directly in `app.py`/CLI.
+- `to_ui_text()` formatting should remain stable for readable remediation hints.
+"""
+
 from __future__ import annotations
 
 

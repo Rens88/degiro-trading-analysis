@@ -1,3 +1,18 @@
+"""
+AGENT_NOTE: Cash and total-value reconciliation primitives.
+
+Interdependencies:
+- `TotalsResult` feeds `src/tables.py` and validation sections in `src/app.py`.
+- `CashReconciliationResult` feeds validation/diagnostic tables in `src/app.py`
+  and strategy startup cash-detail merging in `src/strategy_check.py`.
+
+When editing:
+- Keep dataclass fields and cash-source semantics stable.
+- If classification rules change (`cash_row_mask`), verify totals and spread
+  outputs because holdings/cash splits propagate widely.
+- See `src/INTERDEPENDENCIES.md` for edit checklist.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -4,18 +4,139 @@
     "dataset_b_dir": "data\\spaarbeleggen",
     "mappings_path": "mappings.yml"
   },
-  "saved_at": "2026-02-20T20:40:35",
+  "saved_at": "2026-02-23T21:08:42",
   "strategy": {
     "desired_etf_holdings": 4,
     "desired_non_etf_holdings": 12,
+    "holding_category_overrides": {
+      "BMG3602E1084": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "DE0005552004": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "DE000A0D6554": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "FR0000021842": {
+        "industry": "ETF (other)",
+        "style": "Unclassified"
+      },
+      "IE00B0M63284": {
+        "industry": "Real Estate",
+        "style": "Dividend"
+      },
+      "IE00B1XNHC34": {
+        "industry": "Energy",
+        "style": "Unclassified"
+      },
+      "IE00B3XXRP09": {
+        "industry": "Broad-market ETF",
+        "style": "Blend"
+      },
+      "IE00B4L5Y983": {
+        "industry": "Broad-market ETF",
+        "style": "Blend"
+      },
+      "IE00B5M1WJ87": {
+        "industry": "Broad-market ETF",
+        "style": "Dividend"
+      },
+      "IE00BKY58G26": {
+        "industry": "ETF (other)",
+        "style": "Unclassified"
+      },
+      "NL0010273215": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "NL0010408704": {
+        "industry": "Broad-market ETF",
+        "style": "Blend"
+      },
+      "NL0011794037": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "NL0011872643": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "NL0012015705": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "NL0014332678": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US02079K3059": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US0231351067": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US17275R1023": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US3703341046": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US3755581036": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US4592001014": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US5951121038": {
+        "industry": "Technology",
+        "style": "Growth"
+      },
+      "US67066G1040": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US7134481081": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US7170811035": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      },
+      "US7427181091": {
+        "industry": "Unclassified",
+        "style": "Unclassified"
+      }
+    },
+    "max_pair_correlation": 0.9,
     "max_single_currency_pct": 65.0,
     "max_single_holding_pct": 12.0,
     "max_single_industry_pct": 35.0,
     "max_top5_holdings_pct": 55.0,
     "min_over_value_eur": 400.0,
     "min_total_holdings": 12,
-    "target_cash_pct": 5.0,
-    "target_etf_fraction": 0.5
+    "target_cash_pct": 0.5,
+    "target_currency_pct": {
+      "EUR": 50.0,
+      "USD": 50.0
+    },
+    "target_etf_fraction": 0.5,
+    "target_industry_pct": {},
+    "target_style_pct": {
+      "Dividend": 33.0,
+      "Growth": 34.0,
+      "Value": 33.0
+    }
   },
   "version": 1
 }

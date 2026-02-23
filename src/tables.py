@@ -1,3 +1,17 @@
+"""
+AGENT_NOTE: Holdings aggregation and strategy threshold tables.
+
+Interdependencies:
+- Consumes normalized holdings and `TotalsResult`.
+- `over_target` output is rendered in `app.py` and used by
+  `strategy_check.py` for action-required signaling.
+
+When editing:
+- Keep output column names stable for UI rendering and CLI formatting.
+- Keep target-per-holding math aligned with spread strategy assumptions.
+- See `src/INTERDEPENDENCIES.md` for contract details.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -23,9 +37,6 @@ def build_four_tables(
     total_value = float(totals.total_value_eur)
     aggregated["value_pct"] = np.where(total_value != 0, aggregated["value_eur"] / total_value * 100.0, np.nan)
 
-    etf = aggregated[aggregated["is_etf"]].copy().sort_values("value_eur", ascending=False)
-    non_etf = aggregated[~aggregated["is_etf"]].copy().sort_values("value_eur", ascending=False)
-
     n_etf = max(int(desired_etf_holdings), 1)
     n_non_etf = max(int(desired_non_etf_holdings), 1)
     aggregated["target_per_holding_pct"] = np.where(
@@ -35,6 +46,9 @@ def build_four_tables(
     )
     aggregated["target_value_eur"] = aggregated["target_per_holding_pct"] / 100.0 * total_value
     aggregated["over_target_eur"] = aggregated["value_eur"] - aggregated["target_value_eur"]
+
+    etf = aggregated[aggregated["is_etf"]].copy().sort_values("value_eur", ascending=False)
+    non_etf = aggregated[~aggregated["is_etf"]].copy().sort_values("value_eur", ascending=False)
     over_target = aggregated[aggregated["over_target_eur"] > min_over_value_eur].copy().sort_values(
         "over_target_eur",
         ascending=False,
@@ -65,9 +79,7 @@ def build_four_tables(
     )
 
     display_cols = [
-        "account_label",
         "product",
-        "isin",
         "ticker",
         "quantity",
         "value_eur",
@@ -75,6 +87,8 @@ def build_four_tables(
         "target_per_holding_pct",
         "target_value_eur",
         "over_target_eur",
+        "isin",
+        "account_label",
     ]
     for df in (etf, non_etf, over_target):
         for col in display_cols:

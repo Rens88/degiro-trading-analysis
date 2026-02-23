@@ -1,3 +1,18 @@
+"""
+AGENT_NOTE: Shared configuration and constants.
+
+Interdependencies:
+- Defaults here are consumed by `src/app.py` sidebar controls and
+  `src/strategy_check.py::_strategy_with_defaults`.
+- Plot color constants are used by `src/plots.py`.
+- State constants are used by Streamlit FSM helpers in `src/app.py`.
+
+When editing:
+- Keep strategy defaults synchronized across app UI, CLI strategy check, and
+  persisted JSON (`strategy/spread_strategy.json`).
+- See `src/INTERDEPENDENCIES.md` for the cross-module contract map.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -51,10 +66,14 @@ DEFAULT_MAX_SINGLE_HOLDING_PCT = 12.0
 DEFAULT_MAX_TOP5_HOLDINGS_PCT = 55.0
 DEFAULT_MAX_SINGLE_CURRENCY_PCT = 65.0
 DEFAULT_MAX_SINGLE_INDUSTRY_PCT = 35.0
+DEFAULT_MAX_PAIR_CORRELATION = 0.90
 DEFAULT_MIN_TOTAL_HOLDINGS = 12
 DEFAULT_STRATEGY_FILE_PATH = Path("strategy/spread_strategy.json")
 DEFAULT_STRATEGY_DATASET_A_DIR = Path("data/pensioenbeleggen")
 DEFAULT_STRATEGY_DATASET_B_DIR = Path("data/spaarbeleggen")
+DEFAULT_TARGET_CURRENCY_PCT = {"EUR": 50.0, "USD": 50.0}
+DEFAULT_TARGET_INDUSTRY_PCT: dict[str, float] = {}
+DEFAULT_TARGET_STYLE_PCT = {"Growth": 34.0, "Value": 33.0, "Dividend": 33.0}
 
 # Fallback ETF list from legacy project.
 DEFAULT_ETF_ISINS = {

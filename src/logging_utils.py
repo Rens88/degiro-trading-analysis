@@ -1,3 +1,12 @@
+"""
+AGENT_NOTE: Shared logging helpers used by Streamlit app and startup CLI.
+
+Interdependencies:
+- `setup_logger()` logger naming/handler behavior is assumed by both
+  `src/app.py` and `src/strategy_check.py`.
+- `log()` timestamp format is used in console + file traces.
+"""
+
 from __future__ import annotations
 
 import logging

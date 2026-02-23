@@ -47,9 +47,17 @@ if "%CHECK_EXIT%"=="10" (
     echo.
     echo Strategy check found required/recommended action.
     echo Launching Streamlit app in a new window...
-    start "DEGIRO Trading Analysis" cmd /c "cd /d \"%ROOT%\" && .venv\Scripts\python.exe -m streamlit run app.py"
-    echo.
-    echo Streamlit is running in a new window.
+    set "DEGIRO_STARTUP_AUTORUN=1"
+    set "DEGIRO_STARTUP_STRATEGY_FILE=%STRATEGY_FILE%"
+    if defined DATASET_A_DIR set "DEGIRO_STARTUP_DATASET_A_DIR=%DATASET_A_DIR%"
+    if defined DATASET_B_DIR set "DEGIRO_STARTUP_DATASET_B_DIR=%DATASET_B_DIR%"
+    if defined MAPPINGS_PATH set "DEGIRO_STARTUP_MAPPINGS_PATH=%MAPPINGS_PATH%"
+    if exist "%ROOT%run_app.bat" (
+        start "DEGIRO Trading Analysis" "%ROOT%run_app.bat"
+    ) else (
+        start "DEGIRO Trading Analysis" cmd /k "cd /d ""%ROOT%"" && call "".venv\Scripts\activate.bat"" && python -m streamlit run src/app.py"
+    )
+    echo If Streamlit does not open, check the new window for errors.
     echo Press any key to close this strategy-check window...
     pause >nul
     exit /b 10

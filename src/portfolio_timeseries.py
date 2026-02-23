@@ -1,3 +1,18 @@
+"""
+AGENT_NOTE: Time-series engine for positions, prices, and portfolio metrics.
+
+Interdependencies:
+- Consumes normalized transactions/account/instruments from `data_import`.
+- `TimeSeriesResult` is consumed by `src/app.py`, `src/insights.py`, and
+  `src/strategy_check.py` (optional correlation checks).
+- Uses Yahoo/cache utilities that also influence offline-mode UI messaging.
+
+When editing:
+- Keep `TimeSeriesResult` fields stable or update all consumers together.
+- Preserve offline/cache runtime state keys used by `app.py`.
+- See `src/INTERDEPENDENCIES.md` for the shared contract map.
+"""
+
 from __future__ import annotations
 
 import json
