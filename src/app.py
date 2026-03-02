@@ -46,6 +46,7 @@ from .config import (
     DEFAULT_MIN_TOTAL_HOLDINGS,
     DEFAULT_MEDIAN_WINDOW_MONTHS,
     DEFAULT_MIN_OVER_VALUE_EUR,
+    DEFAULT_TICKER_CLASSIFICATION_PATH,
     REQUIRED_DATASET_FILES,
     DEFAULT_TARGET_CASH_PCT,
     DEFAULT_TARGET_ETF_FRACTION,
@@ -64,10 +65,12 @@ from .exceptions import UserFacingError
 from .insights import build_ai_generated_insights, build_ai_spread_analysis, build_performance_dashboard
 from .logging_utils import log, setup_logger
 from .plots import (
+    build_allocation_pie_figure,
     build_degiro_costs_quarterly_figure,
     build_benchmark_comparison_figure,
     build_cash_allocation_figure,
     build_drawdown_figure,
+    build_holdings_segment_pie_figure,
     build_holdings_over_time_figure,
     build_performance_over_time_figure,
     build_period_decomposition_figure,
@@ -91,7 +94,6 @@ from .reconciliation import (
     reconciliation_table,
 )
 from .tables import build_four_tables, build_monthly_starting_portfolio_value_table
-from .ticker_characteristics import infer_industry_bucket, infer_style_bucket, resolve_ticker_characteristics
 
 
 MANUAL_MONTHLY_TRACKED_VALUES_RAW: list[tuple[str, str]] = [
@@ -187,6 +189,10 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("strategy_load_requested_path", "")
     st.session_state.setdefault("strategy_load_notice", "")
     st.session_state.setdefault("strategy_load_notice_level", "info")
+    st.session_state.setdefault(
+        "strategy_classification_path",
+        str(DEFAULT_TICKER_CLASSIFICATION_PATH),
+    )
 
 
 def _env_flag(name: str) -> bool:
@@ -239,26 +245,6 @@ def _normalize_target_pct_map_local(value: Any, *, default: dict[str, float]) ->
         pct = pd.to_numeric(raw_pct, errors="coerce")
         if pd.notna(pct):
             out[key] = max(float(pct), 0.0)
-    return out
-
-
-def _normalize_holding_category_overrides_local(value: Any) -> dict[str, dict[str, str]]:
-    if not isinstance(value, dict):
-        return {}
-    out: dict[str, dict[str, str]] = {}
-    for raw_instrument_id, raw_entry in value.items():
-        instrument_id = str(raw_instrument_id).strip()
-        if instrument_id == "" or not isinstance(raw_entry, dict):
-            continue
-        style = str(raw_entry.get("style", "")).strip()
-        industry = str(raw_entry.get("industry", "")).strip()
-        entry: dict[str, str] = {}
-        if style:
-            entry["style"] = style
-        if industry:
-            entry["industry"] = industry
-        if entry:
-            out[instrument_id] = entry
     return out
 
 
@@ -346,9 +332,6 @@ def load_strategy_file(
             raw_strategy.get("target_style_pct"),
             default=DEFAULT_TARGET_STYLE_PCT,
         ),
-        "holding_category_overrides": _normalize_holding_category_overrides_local(
-            raw_strategy.get("holding_category_overrides")
-        ),
     }
 
     raw_sources = payload.get("data_sources", {})
@@ -357,7 +340,12 @@ def load_strategy_file(
     data_sources = {
         "dataset_a_dir": str(raw_sources.get("dataset_a_dir", DEFAULT_STRATEGY_DATASET_A_DIR)),
         "dataset_b_dir": str(raw_sources.get("dataset_b_dir", DEFAULT_STRATEGY_DATASET_B_DIR)),
-        "mappings_path": str(raw_sources.get("mappings_path", "mappings.yml")),
+        "classification_path": str(
+            raw_sources.get(
+                "classification_path",
+                DEFAULT_TICKER_CLASSIFICATION_PATH,
+            )
+        ),
     }
 
     if logger is not None:
@@ -395,7 +383,9 @@ def apply_loaded_strategy_to_session_state(
     st.session_state["strategy_dataset_b_dir"] = str(
         data_sources.get("dataset_b_dir", DEFAULT_STRATEGY_DATASET_B_DIR)
     )
-    st.session_state["strategy_mappings_path"] = str(data_sources.get("mappings_path", "mappings.yml"))
+    st.session_state["strategy_classification_path"] = str(
+        data_sources.get("classification_path", DEFAULT_TICKER_CLASSIFICATION_PATH)
+    )
 
     st.session_state["target_currency_pct_editor_seed"] = _target_pct_seed_df(
         strategy.get("target_currency_pct", DEFAULT_TARGET_CURRENCY_PCT)
@@ -409,9 +399,6 @@ def apply_loaded_strategy_to_session_state(
     st.session_state.pop("target_currency_pct_editor", None)
     st.session_state.pop("target_industry_pct_editor", None)
     st.session_state.pop("target_style_pct_editor", None)
-
-    st.session_state["loaded_holding_category_overrides"] = strategy.get("holding_category_overrides", {})
-    st.session_state.pop("holding_override_editor_sig", None)
 
     st.session_state["workflow"]["processed"] = {}
     st.session_state["workflow"]["summaries"] = {}
@@ -457,7 +444,7 @@ def _autoload_dataset_from_folder(
     panel_key: str,
     panel_title: str,
     folder: Path,
-    mappings_path: Path,
+    classification_path: Path,
     logger: Any,
 ) -> bool:
     if not _has_required_dataset_files(folder):
@@ -471,7 +458,7 @@ def _autoload_dataset_from_folder(
         transactions_source=transactions_path,
         portfolio_source=portfolio_path,
         account_source=account_path,
-        mappings_path=mappings_path,
+        classification_path=classification_path,
     )
     st.session_state["workflow"]["datasets"][panel_key] = {
         "dataset": dataset,
@@ -516,9 +503,9 @@ def apply_startup_autoload(*, logger: Any) -> None:
         os.getenv("DEGIRO_STARTUP_DATASET_B_DIR"),
         data_sources.get("dataset_b_dir", DEFAULT_STRATEGY_DATASET_B_DIR),
     )
-    mappings_path = _resolve_startup_path(
-        os.getenv("DEGIRO_STARTUP_MAPPINGS_PATH"),
-        data_sources.get("mappings_path", "mappings.yml"),
+    classification_path = _resolve_startup_path(
+        os.getenv("DEGIRO_STARTUP_CLASSIFICATION_PATH"),
+        data_sources.get("classification_path", DEFAULT_TICKER_CLASSIFICATION_PATH),
     )
 
     loaded_count = 0
@@ -532,7 +519,7 @@ def apply_startup_autoload(*, logger: Any) -> None:
                 panel_key=panel_key,
                 panel_title=panel_title,
                 folder=folder,
-                mappings_path=mappings_path,
+                classification_path=classification_path,
                 logger=logger,
             ):
                 loaded_count += 1
@@ -778,11 +765,6 @@ def render_sidebar(*, logger: Any) -> None:
             disabled=not at_or_after(STATE_SELECTING_PARAMS),
             bucket_label="style",
         )
-    with st.sidebar.expander("Holding category overrides", expanded=False):
-        holding_category_overrides = holding_category_overrides_editor(
-            datasets=st.session_state["workflow"]["datasets"],
-            disabled=not at_or_after(STATE_SELECTING_PARAMS),
-        )
     strategy_file_path = st.sidebar.text_input(
         "strategy_file_path",
         value=str(st.session_state.get("strategy_file_path", DEFAULT_STRATEGY_FILE_PATH)),
@@ -801,11 +783,11 @@ def render_sidebar(*, logger: Any) -> None:
         disabled=not at_or_after(STATE_SELECTING_PARAMS),
         help="Folder expected to contain Dataset B exports (Transactions.csv, Portfolio.csv, Account.csv).",
     )
-    strategy_mappings_path = st.sidebar.text_input(
-        "strategy_mappings_path",
-        value=str(st.session_state.get("strategy_mappings_path", "mappings.yml")),
+    strategy_classification_path = st.sidebar.text_input(
+        "strategy_classification_path",
+        value=str(st.session_state.get("strategy_classification_path", DEFAULT_TICKER_CLASSIFICATION_PATH)),
         disabled=not at_or_after(STATE_SELECTING_PARAMS),
-        help="Mappings file path used by both apps.",
+        help="Ticker classification CSV used by both apps.",
     )
 
     params = {
@@ -825,7 +807,6 @@ def render_sidebar(*, logger: Any) -> None:
         "target_currency_pct": target_currency_pct,
         "target_industry_pct": target_industry_pct,
         "target_style_pct": target_style_pct,
-        "holding_category_overrides": holding_category_overrides,
     }
     strategy_action_cols = st.sidebar.columns(2)
     if strategy_action_cols[0].button("Load strategy", disabled=not at_or_after(STATE_SELECTING_PARAMS)):
@@ -851,12 +832,11 @@ def render_sidebar(*, logger: Any) -> None:
                     "target_currency_pct": params["target_currency_pct"],
                     "target_industry_pct": params["target_industry_pct"],
                     "target_style_pct": params["target_style_pct"],
-                    "holding_category_overrides": params["holding_category_overrides"],
                 },
                 data_sources={
                     "dataset_a_dir": strategy_dataset_a_dir,
                     "dataset_b_dir": strategy_dataset_b_dir,
-                    "mappings_path": strategy_mappings_path,
+                    "classification_path": strategy_classification_path,
                 },
                 logger=logger,
             )
@@ -1015,7 +995,7 @@ def render_dataset_panel(
                         transactions_source=sample_dir / "Transactions.csv",
                         portfolio_source=sample_dir / "Portfolio.csv",
                         account_source=sample_dir / "Account.csv",
-                        mappings_path="mappings.yml",
+                        classification_path=DEFAULT_TICKER_CLASSIFICATION_PATH,
                     )
                     source_sig = (
                         "sample",
@@ -1036,7 +1016,7 @@ def render_dataset_panel(
                         transactions_source=by_name["Transactions.csv"],
                         portfolio_source=by_name["Portfolio.csv"],
                         account_source=by_name["Account.csv"],
-                        mappings_path="mappings.yml",
+                        classification_path=DEFAULT_TICKER_CLASSIFICATION_PATH,
                     )
                     source_sig = (
                         "upload",
@@ -1127,255 +1107,6 @@ def target_pct_map_editor(
             pct = pd.to_numeric(getattr(row, "target_pct", np.nan), errors="coerce")
             if bucket and pd.notna(pct):
                 out[bucket] = max(float(pct), 0.0)
-    return out
-
-
-def holding_category_overrides_editor(
-    *,
-    datasets: dict[str, dict[str, Any]],
-    disabled: bool,
-) -> dict[str, dict[str, str]]:
-    # AGENT_NOTE: Overrides are keyed by instrument_id and feed directly into
-    # `insights.build_ai_spread_analysis()` for final style/industry bucketing.
-    instruments_rows: list[dict[str, Any]] = []
-    for row in datasets.values():
-        ds = row.get("dataset")
-        if ds is None:
-            continue
-        instruments = getattr(ds, "instruments", pd.DataFrame())
-        if not isinstance(instruments, pd.DataFrame) or instruments.empty:
-            continue
-        if "is_cash_like" in instruments.columns:
-            cash_mask = instruments["is_cash_like"].fillna(False).astype(bool)
-        else:
-            cash_mask = pd.Series(False, index=instruments.index, dtype=bool)
-        cur = instruments.loc[~cash_mask].copy()
-        if cur.empty:
-            continue
-        for item in cur.itertuples(index=False):
-            instrument_id = str(getattr(item, "instrument_id", "")).strip()
-            if instrument_id == "":
-                continue
-            product = str(getattr(item, "product", "")).strip()
-            ticker = str(getattr(item, "ticker", "")).strip()
-            is_etf = bool(getattr(item, "is_etf", False))
-            instruments_rows.append(
-                {
-                    "instrument_id": instrument_id,
-                    "product": product,
-                    "ticker": ticker,
-                    "is_etf": is_etf,
-                }
-            )
-    if not instruments_rows:
-        st.caption("Load at least one dataset to edit category overrides.")
-        return {}
-
-    base = (
-        pd.DataFrame(instruments_rows)
-        .drop_duplicates(subset=["instrument_id"], keep="first")
-        .sort_values("product")
-        .reset_index(drop=True)
-    )
-    base, characteristics_stats = resolve_ticker_characteristics(
-        instruments_df=base,
-        ticker_classifications_path=Path("ticker_classifications.csv"),
-        auto_append_missing=True,
-    )
-    appended_count = int(characteristics_stats.get("appended_count", 0))
-    if appended_count > 0:
-        st.caption(
-            f"Updated ticker characteristics: appended {appended_count} new instrument(s) to "
-            "`ticker_classifications.csv` with `t.b.d.` placeholders."
-        )
-    base["style"] = base["style"].fillna("").astype(str).str.strip()
-    base["industry"] = base["industry"].fillna("").astype(str).str.strip()
-    base["auto_style"] = base["auto_style"].fillna("").astype(str).str.strip()
-    base["auto_industry"] = base["auto_industry"].fillna("").astype(str).str.strip()
-    base["style"] = np.where(base["style"].astype(str).str.strip().eq(""), base["auto_style"], base["style"])
-    base["industry"] = np.where(base["industry"].astype(str).str.strip().eq(""), base["auto_industry"], base["industry"])
-
-    default_override_map: dict[str, dict[str, str]] = {}
-    legacy_inferred_map: dict[str, dict[str, str]] = {}
-    for row in base.itertuples(index=False):
-        key = str(getattr(row, "instrument_id", "")).strip()
-        if key == "":
-            continue
-        product = str(getattr(row, "product", "")).strip()
-        ticker = str(getattr(row, "ticker", "")).strip()
-        is_etf = bool(getattr(row, "is_etf", False))
-        default_override_map[key] = {
-            "style": str(getattr(row, "style", "")).strip(),
-            "industry": str(getattr(row, "industry", "")).strip(),
-        }
-        legacy_inferred_map[key] = {
-            "style": infer_style_bucket(product=product, ticker=ticker, is_etf=is_etf),
-            "industry": infer_industry_bucket(product=product, ticker=ticker, is_etf=is_etf),
-        }
-    st.session_state["holding_override_editor_default_map"] = default_override_map
-
-    base = base[["instrument_id", "ticker", "product", "auto_style", "style", "auto_industry", "industry"]].copy()
-
-    seed_sig = tuple(
-        base[["instrument_id", "style", "industry"]]
-        .fillna("")
-        .astype(str)
-        .itertuples(index=False, name=None)
-    )
-    if st.session_state.get("holding_override_editor_sig") != seed_sig:
-        prev_df = st.session_state.get("holding_override_editor_df")
-        prev_map: dict[str, dict[str, str]] = {}
-        if isinstance(prev_df, pd.DataFrame) and not prev_df.empty:
-            for row in prev_df.itertuples(index=False):
-                key = str(getattr(row, "instrument_id", "")).strip()
-                if key == "":
-                    continue
-                prev_map[key] = {
-                    "style": str(getattr(row, "style", "")).strip(),
-                    "industry": str(getattr(row, "industry", "")).strip(),
-                }
-        loaded_overrides = st.session_state.pop("loaded_holding_category_overrides", None)
-        stale_loaded_fields = 0
-        if isinstance(loaded_overrides, dict):
-            for instrument_id, entry in loaded_overrides.items():
-                key = str(instrument_id).strip()
-                if key == "" or not isinstance(entry, dict):
-                    continue
-                default_entry = default_override_map.get(key, {})
-                legacy_entry = legacy_inferred_map.get(key, {})
-                loaded_style = str(entry.get("style", "")).strip()
-                loaded_industry = str(entry.get("industry", "")).strip()
-                keep_style = loaded_style
-                keep_industry = loaded_industry
-                if (
-                    loaded_style != ""
-                    and loaded_style == str(legacy_entry.get("style", ""))
-                    and loaded_style != str(default_entry.get("style", ""))
-                ):
-                    keep_style = ""
-                    stale_loaded_fields += 1
-                if (
-                    loaded_industry != ""
-                    and loaded_industry == str(legacy_entry.get("industry", ""))
-                    and loaded_industry != str(default_entry.get("industry", ""))
-                ):
-                    keep_industry = ""
-                    stale_loaded_fields += 1
-                if key not in prev_map:
-                    prev_map[key] = {}
-                if keep_style != "":
-                    prev_map[key]["style"] = keep_style
-                if keep_industry != "":
-                    prev_map[key]["industry"] = keep_industry
-        if stale_loaded_fields > 0:
-            st.caption(
-                f"Ignored {stale_loaded_fields} legacy auto override value(s) from the saved strategy so "
-                "CSV classifications are shown in Section 6."
-            )
-        default_style = base["style"].fillna("").astype(str)
-        default_industry = base["industry"].fillna("").astype(str)
-        base["style"] = base["instrument_id"].map(
-            lambda k: prev_map.get(str(k), {}).get("style", "")
-        )
-        base["industry"] = base["instrument_id"].map(
-            lambda k: prev_map.get(str(k), {}).get("industry", "")
-        )
-        base["style"] = np.where(base["style"].astype(str).str.strip().eq(""), default_style, base["style"])
-        base["industry"] = np.where(
-            base["industry"].astype(str).str.strip().eq(""),
-            default_industry,
-            base["industry"],
-        )
-        base["style"] = np.where(base["style"].astype(str).str.strip().eq(""), base["auto_style"], base["style"])
-        base["industry"] = np.where(
-            base["industry"].astype(str).str.strip().eq(""),
-            base["auto_industry"],
-            base["industry"],
-        )
-        st.session_state["holding_override_editor_sig"] = seed_sig
-        st.session_state["holding_override_editor_df"] = base
-
-    edited = st.data_editor(
-        st.session_state["holding_override_editor_df"],
-        key="holding_override_editor_widget",
-        hide_index=True,
-        width="stretch",
-        disabled=[
-            "instrument_id",
-            "ticker",
-            "product",
-            "auto_style",
-            "auto_industry",
-            *(["style", "industry"] if disabled else []),
-        ],
-        num_rows="fixed",
-        column_order=[
-            "instrument_id",
-            "ticker",
-            "product",
-            "auto_style",
-            "style",
-            "auto_industry",
-            "industry",
-        ],
-        column_config={
-            "instrument_id": st.column_config.TextColumn(
-                "instrument_id",
-                required=True,
-                help="Unique instrument identifier.",
-            ),
-            "ticker": st.column_config.TextColumn(
-                "ticker",
-                help="Mapped ticker symbol used in pricing and analytics.",
-            ),
-            "product": st.column_config.TextColumn(
-                "product",
-                help="Original product name from DEGIRO export.",
-            ),
-            "auto_style": st.column_config.TextColumn(
-                "auto_style",
-                help="Automatically inferred style bucket.",
-            ),
-            "style": st.column_config.TextColumn(
-                "style",
-                help="Manual style override (optional).",
-            ),
-            "auto_industry": st.column_config.TextColumn(
-                "auto_industry",
-                help="Automatically inferred industry bucket.",
-            ),
-            "industry": st.column_config.TextColumn(
-                "industry",
-                help="Manual industry override (optional).",
-            ),
-        },
-    )
-    if isinstance(edited, pd.DataFrame):
-        st.session_state["holding_override_editor_df"] = edited
-    out: dict[str, dict[str, str]] = {}
-    final_df = st.session_state.get("holding_override_editor_df", pd.DataFrame())
-    default_override_map = st.session_state.get("holding_override_editor_default_map", {})
-    if isinstance(final_df, pd.DataFrame):
-        for row in final_df.itertuples(index=False):
-            instrument_id = str(getattr(row, "instrument_id", "")).strip()
-            if instrument_id == "":
-                continue
-            style = str(getattr(row, "style", "")).strip()
-            industry = str(getattr(row, "industry", "")).strip()
-            default_entry = (
-                default_override_map.get(instrument_id, {})
-                if isinstance(default_override_map, dict)
-                else {}
-            )
-            default_style = str(default_entry.get("style", "")).strip()
-            default_industry = str(default_entry.get("industry", "")).strip()
-            entry: dict[str, str] = {}
-            if style and style != default_style:
-                entry["style"] = style
-            if industry and industry != default_industry:
-                entry["industry"] = industry
-            if entry:
-                out[instrument_id] = entry
     return out
 
 
@@ -1695,11 +1426,10 @@ def process_loaded_datasets(
             "target_currency_pct": params.get("target_currency_pct", {}),
             "target_industry_pct": params.get("target_industry_pct", {}),
             "target_style_pct": params.get("target_style_pct", {}),
-            "holding_category_overrides": params.get("holding_category_overrides", {}),
         },
         prices_eur=ts_result.prices_eur,
-        ticker_classifications_path=Path("ticker_classifications.csv"),
-        auto_append_ticker_characteristics=True,
+        ticker_classifications_path=DEFAULT_TICKER_CLASSIFICATION_PATH,
+        auto_append_ticker_characteristics=False,
     )
     benchmark_bundle = build_benchmark_bundle(
         metrics_index=ts_result.metrics.index,
@@ -2123,18 +1853,45 @@ def render_main(*, logger: Any) -> None:
         ticker = str(row.get("ticker", "")).strip().lower()
         return f"product::{product}|ticker::{ticker}"
 
-    def _count_over_target_by_segment() -> tuple[int, int]:
+    def _over_target_key_set() -> set[str]:
         over_df = tables_data.get("over_target", pd.DataFrame())
+        if not isinstance(over_df, pd.DataFrame) or over_df.empty:
+            return set()
+        return {_holding_key(row) for _, row in over_df.iterrows()}
+
+    def _segment_with_over_target_flag(segment_df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(segment_df, pd.DataFrame) or segment_df.empty:
+            return pd.DataFrame()
+        over_df = tables_data.get("over_target", pd.DataFrame())
+        over_value_map: dict[str, float] = {}
+        if isinstance(over_df, pd.DataFrame) and not over_df.empty:
+            for _, row in over_df.iterrows():
+                key = _holding_key(row)
+                over_value = pd.to_numeric(row.get("over_target_eur"), errors="coerce")
+                over_value_map[key] = float(over_value) if pd.notna(over_value) else 0.0
+        over_keys = _over_target_key_set()
+        out = segment_df.copy()
+        out["over_target_eur"] = [
+            over_value_map.get(_holding_key(row), 0.0) for _, row in out.iterrows()
+        ]
+        out["is_over_target_threshold"] = [
+            _holding_key(row) in over_keys for _, row in out.iterrows()
+        ]
+        return out
+
+    def _count_over_target_by_segment() -> tuple[int, int]:
         etf_df = tables_data.get("etf", pd.DataFrame())
         non_etf_df = tables_data.get("non_etf", pd.DataFrame())
-        if any(not isinstance(df, pd.DataFrame) or df.empty for df in [over_df, etf_df, non_etf_df]):
+        if any(not isinstance(df, pd.DataFrame) or df.empty for df in [etf_df, non_etf_df]):
             return 0, 0
         etf_keys = {_holding_key(row) for _, row in etf_df.iterrows()}
         non_etf_keys = {_holding_key(row) for _, row in non_etf_df.iterrows()}
+        over_keys = _over_target_key_set()
+        if not over_keys:
+            return 0, 0
         etf_count = 0
         non_etf_count = 0
-        for _, row in over_df.iterrows():
-            key = _holding_key(row)
+        for key in over_keys:
             if key in etf_keys:
                 etf_count += 1
             elif key in non_etf_keys:
@@ -2559,30 +2316,33 @@ def render_main(*, logger: Any) -> None:
             "target_per_holding_pct logic: first split by target_etf_fraction, then divide ETF share by "
             "`desired_etf_holdings` and non-ETF share by `desired_non_etf_holdings`."
         )
-        tab1, tab2, tab3, tab4 = st.tabs(
+        summary_df = tables_data.get("summary", pd.DataFrame())
+        combined_portfolio_value = value_from_summary(summary_df, "combined value")
+        etf_table = tables_data.get("etf", pd.DataFrame())
+        non_etf_table = tables_data.get("non_etf", pd.DataFrame())
+        over_target_table = tables_data.get("over_target", pd.DataFrame())
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
             [
                 "ETFs characteristics",
                 "non-ETFs characteristics",
                 "Summary with subtotals",
                 "Holdings over target threshold",
+                "Pie charts",
             ]
         )
         with tab1:
-            etf_table = tables_data.get("etf", pd.DataFrame())
             render_dataframe(
                 etf_table,
                 width="stretch",
                 column_formats=four_table_format_map(etf_table),
             )
         with tab2:
-            non_etf_table = tables_data.get("non_etf", pd.DataFrame())
             render_dataframe(
                 non_etf_table,
                 width="stretch",
                 column_formats=four_table_format_map(non_etf_table),
             )
         with tab3:
-            summary_df = tables_data.get("summary", pd.DataFrame())
             render_dataframe(
                 summary_df,
                 width="stretch",
@@ -2597,12 +2357,39 @@ def render_main(*, logger: Any) -> None:
                 f"= EUR {combined:,.2f}"
             )
         with tab4:
-            over_target_table = tables_data.get("over_target", pd.DataFrame())
             render_dataframe(
                 over_target_table,
                 width="stretch",
                 column_formats=four_table_format_map(over_target_table),
             )
+        with tab5:
+            etf_pie_df = _segment_with_over_target_flag(etf_table)
+            non_etf_pie_df = _segment_with_over_target_flag(non_etf_table)
+            pie_left, pie_right = st.columns(2)
+            with pie_left:
+                etf_pie = build_holdings_segment_pie_figure(
+                    holdings_df=etf_pie_df,
+                    title="ETF holdings (% of ETF sleeve)",
+                    total_portfolio_value_eur=combined_portfolio_value,
+                )
+                plotly_chart_stretch(etf_pie)
+            with pie_right:
+                non_etf_pie = build_holdings_segment_pie_figure(
+                    holdings_df=non_etf_pie_df,
+                    title="Non-ETF holdings (% of non-ETF sleeve)",
+                    total_portfolio_value_eur=combined_portfolio_value,
+                )
+                plotly_chart_stretch(non_etf_pie)
+            threshold_value = _to_float(
+                st.session_state.get("min_over_value_eur", DEFAULT_MIN_OVER_VALUE_EUR)
+            )
+            if np.isfinite(threshold_value):
+                st.caption(
+                    f"Red and pulled slices are above target threshold (over target by more than "
+                    f"EUR {threshold_value:,.2f})."
+                )
+            else:
+                st.caption("Red and pulled slices are above target threshold.")
 
     with st.expander("Section 5: Performance", expanded=True):
         st.caption(
@@ -2671,7 +2458,7 @@ def render_main(*, logger: Any) -> None:
     with st.expander("Section 6: AI Generated Spread Analysis", expanded=True):
         st.caption(
             "Spread diagnostics for ETF/non-ETF strategy, cash target, concentration risk, "
-            "currency mix, industry/style allocation, correlation overlap risk, and concrete next actions."
+            "currency and classification allocation, correlation overlap risk, and concrete next actions."
         )
         if not isinstance(spread_analysis, dict) or not spread_analysis:
             st.info("No spread analysis available for the current dataset.")
@@ -2683,8 +2470,14 @@ def render_main(*, logger: Any) -> None:
             for line in spread_lines:
                 st.write(f"- {line}")
 
-        tab_strategy, tab_alloc, tab_spread_actions, tab_next = st.tabs(
-            ["Strategy checks", "Currency/industry/style", "Concentration and actions", "What to do next"]
+        tab_strategy, tab_alloc, tab_alloc_pies, tab_spread_actions, tab_next = st.tabs(
+            [
+                "Strategy checks",
+                "Allocation tables",
+                "Allocation pie charts",
+                "Concentration and actions",
+                "What to do next",
+            ]
         )
         with tab_strategy:
             strategy_df = spread_analysis.get("strategy_checks_df", pd.DataFrame())
@@ -2709,19 +2502,78 @@ def render_main(*, logger: Any) -> None:
             else:
                 st.info("No currency allocation table available.")
 
-            industry_df = spread_analysis.get("industry_allocation_df", pd.DataFrame())
-            if isinstance(industry_df, pd.DataFrame) and not industry_df.empty:
-                st.markdown("**Industry allocation**")
-                render_dataframe(industry_df, width="stretch")
+            asset_class_df = spread_analysis.get("asset_class_allocation_df", pd.DataFrame())
+            if isinstance(asset_class_df, pd.DataFrame) and not asset_class_df.empty:
+                st.markdown("**Asset class allocation**")
+                render_dataframe(asset_class_df, width="stretch")
             else:
-                st.info("No industry allocation table available.")
+                st.info("No asset class allocation table available.")
 
-            style_df = spread_analysis.get("style_allocation_df", pd.DataFrame())
-            if isinstance(style_df, pd.DataFrame) and not style_df.empty:
-                st.markdown("**Style allocation (growth/value/dividend/etc.)**")
-                render_dataframe(style_df, width="stretch")
+            primary_style_df = spread_analysis.get("primary_style_allocation_df", pd.DataFrame())
+            if isinstance(primary_style_df, pd.DataFrame) and not primary_style_df.empty:
+                st.markdown("**Primary style allocation**")
+                render_dataframe(primary_style_df, width="stretch")
             else:
-                st.info("No style allocation table available.")
+                st.info("No primary style allocation table available.")
+
+            secondary_factor_df = spread_analysis.get("secondary_factor_allocation_df", pd.DataFrame())
+            if isinstance(secondary_factor_df, pd.DataFrame) and not secondary_factor_df.empty:
+                st.markdown("**Secondary factor allocation**")
+                render_dataframe(secondary_factor_df, width="stretch")
+            else:
+                st.info("No secondary factor allocation table available.")
+
+            gics_sector_df = spread_analysis.get("gics_sector_allocation_df", pd.DataFrame())
+            if isinstance(gics_sector_df, pd.DataFrame) and not gics_sector_df.empty:
+                st.markdown("**GICS sector allocation**")
+                render_dataframe(gics_sector_df, width="stretch")
+            else:
+                st.info("No GICS sector allocation table available.")
+
+            gics_industry_group_df = spread_analysis.get("gics_industry_group_allocation_df", pd.DataFrame())
+            if isinstance(gics_industry_group_df, pd.DataFrame) and not gics_industry_group_df.empty:
+                st.markdown("**GICS industry group allocation**")
+                render_dataframe(gics_industry_group_df, width="stretch")
+            else:
+                st.info("No GICS industry group allocation table available.")
+
+            gics_industry_df = spread_analysis.get("gics_industry_allocation_df", pd.DataFrame())
+            if isinstance(gics_industry_df, pd.DataFrame) and not gics_industry_df.empty:
+                st.markdown("**GICS industry allocation**")
+                render_dataframe(gics_industry_df, width="stretch")
+            else:
+                st.info("No GICS industry allocation table available.")
+
+            gics_sub_industry_df = spread_analysis.get("gics_sub_industry_allocation_df", pd.DataFrame())
+            if isinstance(gics_sub_industry_df, pd.DataFrame) and not gics_sub_industry_df.empty:
+                st.markdown("**GICS sub-industry allocation**")
+                render_dataframe(gics_sub_industry_df, width="stretch")
+            else:
+                st.info("No GICS sub-industry allocation table available.")
+
+        with tab_alloc_pies:
+            pie_specs = [
+                ("Currency", "currency_allocation_df", "currency", "total_eur"),
+                ("Asset Class", "asset_class_allocation_df", "asset_class", "value_eur"),
+                ("Primary Style", "primary_style_allocation_df", "primary_style", "value_eur"),
+                ("Secondary Factor", "secondary_factor_allocation_df", "secondary_factor", "value_eur"),
+                ("GICS Sector", "gics_sector_allocation_df", "gics_sector", "value_eur"),
+                ("GICS Industry Group", "gics_industry_group_allocation_df", "gics_industry_group", "value_eur"),
+                ("GICS Industry", "gics_industry_allocation_df", "gics_industry", "value_eur"),
+                ("GICS Sub-Industry", "gics_sub_industry_allocation_df", "gics_sub_industry", "value_eur"),
+            ]
+            pie_cols = st.columns(2)
+            for idx, (title, df_key, category_col, value_col) in enumerate(pie_specs):
+                target_col = pie_cols[idx % 2]
+                with target_col:
+                    alloc_df = spread_analysis.get(df_key, pd.DataFrame())
+                    pie_fig = build_allocation_pie_figure(
+                        allocation_df=alloc_df,
+                        category_col=category_col,
+                        value_col=value_col,
+                        title=title,
+                    )
+                    plotly_chart_stretch(pie_fig)
 
         with tab_spread_actions:
             concentration_df = spread_analysis.get("concentration_df", pd.DataFrame())
@@ -2744,6 +2596,13 @@ def render_main(*, logger: Any) -> None:
                 render_dataframe(corr_df, width="stretch")
             else:
                 st.info("No high-correlation warning pairs detected.")
+
+            metadata_conflicts_df = spread_analysis.get("instrument_metadata_conflicts_df", pd.DataFrame())
+            if isinstance(metadata_conflicts_df, pd.DataFrame) and not metadata_conflicts_df.empty:
+                st.warning(
+                    "Detected duplicate instrument_id rows with conflicting product/ticker/currency metadata."
+                )
+                render_dataframe(metadata_conflicts_df, width="stretch")
 
         with tab_next:
             next_df = spread_analysis.get("what_to_do_next_df", pd.DataFrame())

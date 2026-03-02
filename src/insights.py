@@ -133,6 +133,7 @@ def build_ai_spread_analysis(
     gating in `src/strategy_check.py`.
     """
     holdings = _normalized_holdings_for_spread(holdings_df)
+    instrument_metadata_conflicts_df = _build_instrument_metadata_conflicts_df(holdings=holdings)
     if holdings.empty and (not np.isfinite(total_value_eur) or total_value_eur <= 0.0):
         return {}
 
@@ -164,30 +165,58 @@ def build_ai_spread_analysis(
     }
     target_industry_pct = _to_target_pct_map(strategy.get("target_industry_pct"))
     target_style_pct = _to_target_pct_map(strategy.get("target_style_pct"))
-    holding_category_overrides = _normalize_holding_category_overrides(
-        strategy.get("holding_category_overrides")
-    )
 
     resolved_characteristics, _ = resolve_ticker_characteristics(
         instruments_df=holdings,
         ticker_classifications_path=ticker_classifications_path,
         auto_append_missing=bool(auto_append_ticker_characteristics),
     )
-    style_series = pd.Series("", index=holdings.index, dtype="object")
-    industry_series = pd.Series("", index=holdings.index, dtype="object")
-    if isinstance(resolved_characteristics, pd.DataFrame) and not resolved_characteristics.empty:
-        if "style" in resolved_characteristics.columns:
-            style_series = resolved_characteristics["style"]
-        if "industry" in resolved_characteristics.columns:
-            industry_series = resolved_characteristics["industry"]
-    holdings["style"] = style_series.fillna("").astype(str).str.strip()
-    holdings["industry"] = industry_series.fillna("").astype(str).str.strip()
-    holdings["style"] = holdings["style"].replace("", "Unclassified")
-    holdings["industry"] = holdings["industry"].replace("", "Unclassified")
-    holdings = _apply_holding_category_overrides(
-        holdings=holdings,
-        overrides=holding_category_overrides,
+    category_columns = [
+        "asset_class",
+        "primary_style",
+        "secondary_factor",
+        "gics_sector",
+        "gics_industry_group",
+        "gics_industry",
+        "gics_sub_industry",
+    ]
+    for col in category_columns:
+        base_series = (
+            holdings[col].fillna("").astype(str).str.strip()
+            if col in holdings.columns
+            else pd.Series("", index=holdings.index, dtype="object")
+        )
+        resolved_series = (
+            resolved_characteristics[col].fillna("").astype(str).str.strip()
+            if isinstance(resolved_characteristics, pd.DataFrame)
+            and not resolved_characteristics.empty
+            and col in resolved_characteristics.columns
+            else pd.Series("", index=holdings.index, dtype="object")
+        )
+        holdings[col] = np.where(resolved_series.ne(""), resolved_series, base_series)
+
+    holdings["asset_class"] = holdings["asset_class"].fillna("").astype(str).str.strip()
+    holdings["asset_class"] = np.where(
+        holdings["asset_class"].eq(""),
+        np.where(holdings["is_etf"], "ETF", "Equity"),
+        holdings["asset_class"],
     )
+    holdings["primary_style"] = holdings["primary_style"].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    holdings["secondary_factor"] = (
+        holdings["secondary_factor"].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    )
+    holdings["gics_sector"] = holdings["gics_sector"].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    holdings["gics_industry_group"] = (
+        holdings["gics_industry_group"].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    )
+    holdings["gics_industry"] = holdings["gics_industry"].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    holdings["gics_sub_industry"] = (
+        holdings["gics_sub_industry"].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    )
+
+    # Backward-compatible aliases used by existing strategy checks and action tables.
+    holdings["style"] = holdings["primary_style"]
+    holdings["industry"] = holdings["gics_industry"]
 
     etf_mask = holdings["is_etf"].fillna(False).astype(bool)
     etf_value = float(holdings.loc[etf_mask, "value_eur"].sum())
@@ -236,6 +265,19 @@ def build_ai_spread_analysis(
     largest_industry_name = str(largest_industry.iloc[0]["industry"]) if not largest_industry.empty else "N/A"
     largest_industry_pct = float(largest_industry.iloc[0]["pct_total"]) if not largest_industry.empty else 0.0
     style_allocation_df = _build_style_allocation_df(holdings=holdings, total_value=total_value)
+    asset_class_allocation_df = _build_asset_class_allocation_df(holdings=holdings, total_value=total_value)
+    primary_style_allocation_df = _build_primary_style_allocation_df(holdings=holdings, total_value=total_value)
+    secondary_factor_allocation_df = _build_secondary_factor_allocation_df(holdings=holdings, total_value=total_value)
+    gics_sector_allocation_df = _build_gics_sector_allocation_df(holdings=holdings, total_value=total_value)
+    gics_industry_group_allocation_df = _build_gics_industry_group_allocation_df(
+        holdings=holdings,
+        total_value=total_value,
+    )
+    gics_industry_allocation_df = _build_gics_industry_allocation_df(holdings=holdings, total_value=total_value)
+    gics_sub_industry_allocation_df = _build_gics_sub_industry_allocation_df(
+        holdings=holdings,
+        total_value=total_value,
+    )
 
     currency_allocation_df = _attach_target_pct_columns(
         allocation_df=currency_allocation_df,
@@ -713,6 +755,13 @@ def build_ai_spread_analysis(
         summary_lines.append("Industry target map is configured and used in buy-allocation suggestions.")
     if target_style_pct:
         summary_lines.append("Style target map is configured and used in buy-allocation suggestions.")
+    if not instrument_metadata_conflicts_df.empty:
+        summary_lines.append(
+            (
+                "Data quality warning: some instrument_id values have conflicting product/ticker/currency "
+                "metadata across merged datasets."
+            )
+        )
 
     action_plan_df = pd.DataFrame(action_rows).reset_index(drop=True)
     what_to_do_next_df = pd.DataFrame(what_to_do_rows).reset_index(drop=True)
@@ -723,8 +772,16 @@ def build_ai_spread_analysis(
         "currency_allocation_df": currency_allocation_df,
         "industry_allocation_df": industry_allocation_df,
         "style_allocation_df": style_allocation_df,
+        "asset_class_allocation_df": asset_class_allocation_df,
+        "primary_style_allocation_df": primary_style_allocation_df,
+        "secondary_factor_allocation_df": secondary_factor_allocation_df,
+        "gics_sector_allocation_df": gics_sector_allocation_df,
+        "gics_industry_group_allocation_df": gics_industry_group_allocation_df,
+        "gics_industry_allocation_df": gics_industry_allocation_df,
+        "gics_sub_industry_allocation_df": gics_sub_industry_allocation_df,
         "concentration_df": concentration_df.reset_index(drop=True),
         "correlation_warnings_df": correlation_warnings_df.reset_index(drop=True),
+        "instrument_metadata_conflicts_df": instrument_metadata_conflicts_df.reset_index(drop=True),
         "action_plan_df": action_plan_df,
         "what_to_do_next_df": what_to_do_next_df,
         "target_currency_pct": target_currency_pct,
@@ -1457,10 +1514,37 @@ def _compute_twr(sub: pd.DataFrame) -> float:
 def _normalized_holdings_for_spread(holdings_df: pd.DataFrame) -> pd.DataFrame:
     if holdings_df is None or holdings_df.empty:
         return pd.DataFrame(
-            columns=["instrument_id", "product", "ticker", "currency", "is_etf", "quantity", "value_eur"]
+            columns=[
+                "instrument_id",
+                "product",
+                "ticker",
+                "currency",
+                "is_etf",
+                "quantity",
+                "value_eur",
+                "asset_class",
+                "primary_style",
+                "secondary_factor",
+                "gics_sector",
+                "gics_industry_group",
+                "gics_industry",
+                "gics_sub_industry",
+            ]
         )
     df = holdings_df.copy()
-    for col in ["instrument_id", "product", "ticker", "currency"]:
+    for col in [
+        "instrument_id",
+        "product",
+        "ticker",
+        "currency",
+        "asset_class",
+        "primary_style",
+        "secondary_factor",
+        "gics_sector",
+        "gics_industry_group",
+        "gics_industry",
+        "gics_sub_industry",
+    ]:
         if col not in df.columns:
             df[col] = ""
     if "is_etf" not in df.columns:
@@ -1475,15 +1559,36 @@ def _normalized_holdings_for_spread(holdings_df: pd.DataFrame) -> pd.DataFrame:
     df["ticker"] = df["ticker"].fillna("").astype(str).str.strip()
     df["currency"] = df["currency"].fillna("UNKNOWN").astype(str).str.upper().str.strip()
     df["currency"] = df["currency"].replace("", "UNKNOWN")
+    df["asset_class"] = df["asset_class"].fillna("").astype(str).str.strip()
+    df["primary_style"] = df["primary_style"].fillna("").astype(str).str.strip()
+    df["secondary_factor"] = df["secondary_factor"].fillna("").astype(str).str.strip()
+    df["gics_sector"] = df["gics_sector"].fillna("").astype(str).str.strip()
+    df["gics_industry_group"] = df["gics_industry_group"].fillna("").astype(str).str.strip()
+    df["gics_industry"] = df["gics_industry"].fillna("").astype(str).str.strip()
+    df["gics_sub_industry"] = df["gics_sub_industry"].fillna("").astype(str).str.strip()
     df["is_etf"] = df["is_etf"].fillna(False).astype(bool)
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
     df["value_eur"] = pd.to_numeric(df["value_eur"], errors="coerce").fillna(0.0)
+
+    def _first_notna(values: pd.Series) -> str:
+        for value in values:
+            txt = str(value).strip()
+            if txt not in {"", "nan", "None"}:
+                return txt
+        return ""
 
     grouped = (
         df.groupby(["instrument_id", "product", "ticker", "currency", "is_etf"], dropna=False, as_index=False)
         .agg(
             quantity=("quantity", "sum"),
             value_eur=("value_eur", "sum"),
+            asset_class=("asset_class", _first_notna),
+            primary_style=("primary_style", _first_notna),
+            secondary_factor=("secondary_factor", _first_notna),
+            gics_sector=("gics_sector", _first_notna),
+            gics_industry_group=("gics_industry_group", _first_notna),
+            gics_industry=("gics_industry", _first_notna),
+            gics_sub_industry=("gics_sub_industry", _first_notna),
         )
         .sort_values("value_eur", ascending=False)
     )
@@ -1530,41 +1635,160 @@ def _build_currency_allocation_df(
 
 
 def _build_industry_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
-    if holdings.empty:
-        return pd.DataFrame(columns=["industry", "value_eur", "pct_total", "holding_count"])
-    out = holdings.copy()
-    if "industry" not in out.columns:
-        out["industry"] = "Unclassified"
-    out["industry"] = out["industry"].fillna("Unclassified").astype(str).str.strip().replace("", "Unclassified")
-    grouped = (
-        out.groupby("industry", dropna=False)
-        .agg(
-            value_eur=("value_eur", "sum"),
-            holding_count=("instrument_id", "nunique"),
-        )
-        .reset_index()
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="gics_industry",
+        output_col="industry",
+        total_value=total_value,
     )
-    grouped["pct_total"] = np.where(total_value > 0.0, grouped["value_eur"] / total_value * 100.0, np.nan)
-    return grouped.sort_values("value_eur", ascending=False).reset_index(drop=True)
 
 
 def _build_style_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="primary_style",
+        output_col="style",
+        total_value=total_value,
+    )
+
+
+def _build_asset_class_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="asset_class",
+        output_col="asset_class",
+        total_value=total_value,
+    )
+
+
+def _build_primary_style_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="primary_style",
+        output_col="primary_style",
+        total_value=total_value,
+    )
+
+
+def _build_secondary_factor_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="secondary_factor",
+        output_col="secondary_factor",
+        total_value=total_value,
+    )
+
+
+def _build_gics_sector_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="gics_sector",
+        output_col="gics_sector",
+        total_value=total_value,
+    )
+
+
+def _build_gics_industry_group_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="gics_industry_group",
+        output_col="gics_industry_group",
+        total_value=total_value,
+    )
+
+
+def _build_gics_industry_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="gics_industry",
+        output_col="gics_industry",
+        total_value=total_value,
+    )
+
+
+def _build_gics_sub_industry_allocation_df(*, holdings: pd.DataFrame, total_value: float) -> pd.DataFrame:
+    return _build_category_allocation_df(
+        holdings=holdings,
+        source_col="gics_sub_industry",
+        output_col="gics_sub_industry",
+        total_value=total_value,
+    )
+
+
+def _build_category_allocation_df(
+    *,
+    holdings: pd.DataFrame,
+    source_col: str,
+    output_col: str,
+    total_value: float,
+) -> pd.DataFrame:
     if holdings.empty:
-        return pd.DataFrame(columns=["style", "value_eur", "pct_total", "holding_count"])
+        return pd.DataFrame(columns=[output_col, "value_eur", "pct_total", "holding_count"])
     out = holdings.copy()
-    if "style" not in out.columns:
-        out["style"] = "Unclassified"
-    out["style"] = out["style"].fillna("Unclassified").astype(str).str.strip().replace("", "Unclassified")
+    if source_col not in out.columns:
+        out[source_col] = "Unclassified"
+    out[source_col] = out[source_col].fillna("Unclassified").astype(str).str.strip().replace("", "Unclassified")
     grouped = (
-        out.groupby("style", dropna=False)
+        out.groupby(source_col, dropna=False)
         .agg(
             value_eur=("value_eur", "sum"),
             holding_count=("instrument_id", "nunique"),
         )
         .reset_index()
+        .rename(columns={source_col: output_col})
     )
     grouped["pct_total"] = np.where(total_value > 0.0, grouped["value_eur"] / total_value * 100.0, np.nan)
     return grouped.sort_values("value_eur", ascending=False).reset_index(drop=True)
+
+
+def _build_instrument_metadata_conflicts_df(*, holdings: pd.DataFrame) -> pd.DataFrame:
+    if holdings is None or holdings.empty or "instrument_id" not in holdings.columns:
+        return pd.DataFrame()
+
+    out = holdings.copy()
+    out["instrument_id"] = out["instrument_id"].fillna("").astype(str).str.strip()
+    out = out[out["instrument_id"].ne("")].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    for col in ["product", "ticker", "currency"]:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].fillna("").astype(str).str.strip()
+
+    def _normalized_values(values: pd.Series) -> list[str]:
+        cleaned = [str(v).strip() for v in values]
+        return sorted({v for v in cleaned if v != "" and v.lower() not in {"nan", "none"}})
+
+    def _variant_count(values: pd.Series) -> int:
+        return len(_normalized_values(values))
+
+    def _variant_preview(values: pd.Series) -> str:
+        unique = _normalized_values(values)
+        if len(unique) <= 3:
+            return ", ".join(unique)
+        return ", ".join(unique[:3]) + ", ..."
+
+    grouped = (
+        out.groupby("instrument_id", as_index=False, dropna=False)
+        .agg(
+            row_count=("instrument_id", "size"),
+            product_variants=("product", _variant_count),
+            ticker_variants=("ticker", _variant_count),
+            currency_variants=("currency", _variant_count),
+            product_values=("product", _variant_preview),
+            ticker_values=("ticker", _variant_preview),
+            currency_values=("currency", _variant_preview),
+        )
+        .sort_values("row_count", ascending=False)
+    )
+
+    conflict_mask = (grouped["row_count"] > 1) & (
+        (grouped["product_variants"] > 1)
+        | (grouped["ticker_variants"] > 1)
+        | (grouped["currency_variants"] > 1)
+    )
+    return grouped.loc[conflict_mask].reset_index(drop=True)
 
 
 def _to_target_pct_map(raw: Any) -> dict[str, float]:
@@ -1578,46 +1802,6 @@ def _to_target_pct_map(raw: Any) -> dict[str, float]:
         pct = _to_float(value, np.nan)
         if np.isfinite(pct):
             out[label] = max(float(pct), 0.0)
-    return out
-
-
-def _normalize_holding_category_overrides(raw: Any) -> dict[str, dict[str, str]]:
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, dict[str, str]] = {}
-    for key, value in raw.items():
-        instrument_key = str(key).strip()
-        if instrument_key == "" or not isinstance(value, dict):
-            continue
-        style = str(value.get("style", "")).strip()
-        industry = str(value.get("industry", "")).strip()
-        normalized: dict[str, str] = {}
-        if style:
-            normalized["style"] = style
-        if industry:
-            normalized["industry"] = industry
-        if normalized:
-            out[instrument_key] = normalized
-    return out
-
-
-def _apply_holding_category_overrides(
-    *,
-    holdings: pd.DataFrame,
-    overrides: dict[str, dict[str, str]],
-) -> pd.DataFrame:
-    if holdings.empty or not overrides:
-        return holdings
-    out = holdings.copy()
-    for idx in out.index:
-        key = str(out.at[idx, "instrument_id"]).strip()
-        override = overrides.get(key)
-        if not isinstance(override, dict):
-            continue
-        if "style" in override:
-            out.at[idx, "style"] = str(override["style"]).strip()
-        if "industry" in override:
-            out.at[idx, "industry"] = str(override["industry"]).strip()
     return out
 
 
@@ -1730,10 +1914,20 @@ def _compute_high_correlation_pairs(
         return pd.DataFrame()
     series = prices_eur.copy()
     series.columns = series.columns.astype(str)
-    ids = [str(v) for v in holdings["instrument_id"].astype(str).tolist() if str(v) in series.columns]
+    if "instrument_id" not in holdings.columns:
+        return pd.DataFrame()
+
+    requested_ids = holdings["instrument_id"].fillna("").astype(str).str.strip().tolist()
+    seen_ids: set[str] = set()
+    ids: list[str] = []
+    for instrument_id in requested_ids:
+        if instrument_id == "" or instrument_id not in series.columns or instrument_id in seen_ids:
+            continue
+        seen_ids.add(instrument_id)
+        ids.append(instrument_id)
     if len(ids) < 2:
         return pd.DataFrame()
-    px = series[ids].copy()
+    px = series.loc[:, ids].copy()
     px.index = pd.to_datetime(px.index, errors="coerce")
     px = px[px.index.notna()].sort_index()
     if px.empty:
@@ -1741,15 +1935,46 @@ def _compute_high_correlation_pairs(
     cutoff = px.index.max() - pd.Timedelta(days=int(lookback_days))
     px = px.loc[px.index >= cutoff]
     ret = px.pct_change()
-    valid_cols = [col for col in ret.columns if int(ret[col].notna().sum()) >= int(min_history_days)]
+    if ret.columns.has_duplicates:
+        ret = ret.loc[:, ~ret.columns.duplicated(keep="first")]
+    min_history = max(_to_int(min_history_days, 60), 1)
+    non_na_counts = ret.notna().sum(axis=0)
+    valid_cols = non_na_counts.loc[non_na_counts >= min_history].index.tolist()
     if len(valid_cols) < 2:
         return pd.DataFrame()
     ret = ret[valid_cols]
-    corr = ret.corr(min_periods=int(min_history_days))
+    corr = ret.corr(min_periods=min_history)
     if corr.empty:
         return pd.DataFrame()
 
-    meta = holdings.drop_duplicates(subset=["instrument_id"], keep="first").set_index("instrument_id")
+    meta_source = holdings.copy()
+    meta_source["instrument_id"] = meta_source.get("instrument_id", "").astype(str).str.strip()
+    meta_source = meta_source[meta_source["instrument_id"].ne("")].copy()
+    for col in ["ticker", "product"]:
+        if col not in meta_source.columns:
+            meta_source[col] = ""
+        meta_source[col] = meta_source[col].fillna("").astype(str).str.strip()
+    meta_source["value_pct_total"] = pd.to_numeric(
+        meta_source.get("value_pct_total", pd.Series(np.nan, index=meta_source.index)),
+        errors="coerce",
+    ).fillna(0.0)
+
+    def _first_text(values: pd.Series) -> str:
+        for value in values:
+            txt = str(value).strip()
+            if txt != "" and txt.lower() not in {"nan", "none"}:
+                return txt
+        return ""
+
+    meta = (
+        meta_source.groupby("instrument_id", as_index=True, dropna=False)
+        .agg(
+            ticker=("ticker", _first_text),
+            product=("product", _first_text),
+            value_pct_total=("value_pct_total", "sum"),
+        )
+        .sort_index()
+    )
     rows: list[dict[str, Any]] = []
     cols = list(corr.columns)
     for i in range(len(cols)):

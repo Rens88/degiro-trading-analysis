@@ -10,3 +10,4 @@ __pycache__/
 *.code-workspace
 .venv/
 data/
+/secret_notities.txt

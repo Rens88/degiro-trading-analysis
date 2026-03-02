@@ -23,8 +23,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import yaml
-from yaml import YAMLError
 
 from .config import DEFAULT_ETF_ISINS, REQUIRED_DATASET_FILES
 from .exceptions import UserFacingError
@@ -65,7 +63,7 @@ def load_dataset(
     transactions_source: Any,
     portfolio_source: Any,
     account_source: Any,
-    mappings_path: str | Path = "mappings.yml",
+    classification_path: str | Path = "ticker_classification_complete.csv",
 ) -> LoadedDataset:
     warnings: list[str] = []
     issues: list[dict[str, Any]] = []
@@ -78,11 +76,11 @@ def load_dataset(
     portfolio = normalize_portfolio(portfolio_raw, account_label=account_label, warnings=warnings)
     account = normalize_account(account_raw, account_label=account_label, warnings=warnings)
 
-    mappings = load_mappings(mappings_path)
+    classifications = load_classification_catalog(classification_path)
     instruments = resolve_instrument_mapping(
         portfolio=portfolio,
         transactions=transactions,
-        mappings=mappings,
+        classifications=classifications,
     )
 
     transactions = attach_instrument_metadata(transactions, instruments)
@@ -1071,51 +1069,77 @@ def infer_account_type(description: pd.Series, raw_change: pd.Series | None = No
     return pd.Series(out, index=description.index)
 
 
-def load_mappings(path: str | Path) -> dict[str, dict[str, Any]]:
+def load_classification_catalog(path: str | Path) -> pd.DataFrame:
     p = Path(path)
     if not p.exists():
-        return {"symbols": {}, "currencies": {}, "is_etf": {}, "is_not_etf": {}}
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except YAMLError as exc:
         raise UserFacingError(
-            "mappings.yml has invalid YAML syntax.",
-            f"Fix YAML syntax in mappings.yml. Parser error: {exc}",
-        ) from exc
-
-    if not isinstance(data, dict):
-        raise UserFacingError(
-            "mappings.yml must contain a top-level mapping (dictionary).",
-            "Ensure mappings.yml starts with sections like `symbols:`, `currencies:`, `is_etf:`, `is_not_etf:`.",
+            "Ticker classification file was not found.",
+            f"Expected classification file at: {p}",
         )
 
-    required_sections = ["symbols", "currencies", "is_etf", "is_not_etf"]
-    for section in required_sections:
-        value = data.get(section, {})
-        if value is None:
-            value = {}
-        if not isinstance(value, dict):
-            raise UserFacingError(
-                f"mappings.yml section `{section}` has invalid structure.",
-                f"Section `{section}` must be a key-value mapping, not {type(value).__name__}.",
-            )
+    try:
+        out = pd.read_csv(p, dtype=str, keep_default_na=False)
+    except Exception as exc:
+        raise UserFacingError(
+            "Ticker classification file could not be read.",
+            f"File: {p}\nError: {exc}",
+        ) from exc
 
-    _validate_boolean_section(data.get("is_etf", {}), "is_etf")
-    _validate_boolean_section(data.get("is_not_etf", {}), "is_not_etf")
+    required = [
+        "instrument_id",
+        "ticker",
+        "currency",
+        "asset_class",
+        "primary_style",
+        "secondary_factor",
+        "gics_sector",
+        "gics_industry_group",
+        "gics_industry",
+        "gics_sub_industry",
+    ]
+    missing = [col for col in required if col not in out.columns]
+    if missing:
+        raise UserFacingError(
+            "Ticker classification file is missing required columns.",
+            "Missing columns in ticker_classification_complete.csv: " + ", ".join(missing),
+        )
 
-    return {
-        "symbols": _to_upper_key_dict(data.get("symbols", {})),
-        "currencies": _to_upper_key_dict(data.get("currencies", {})),
-        "is_etf": _to_upper_key_dict(data.get("is_etf", {})),
-        "is_not_etf": _to_upper_key_dict(data.get("is_not_etf", {})),
-    }
+    if "product" not in out.columns:
+        out["product"] = ""
+
+    for col in required + ["product"]:
+        out[col] = out[col].fillna("").astype(str).str.strip()
+    out["instrument_id"] = out["instrument_id"].str.upper()
+    out["ticker"] = out["ticker"].str.upper()
+    out["currency"] = out["currency"].str.upper()
+
+    out["asset_class"] = out["asset_class"].map(_normalize_asset_class_text)
+    invalid_asset = out["asset_class"].eq("")
+    if bool(invalid_asset.any()):
+        bad_rows = out.loc[invalid_asset, ["instrument_id", "ticker", "asset_class"]].head(5)
+        preview = "\n".join(
+            f"- instrument_id={r.instrument_id} ticker={r.ticker}"
+            for r in bad_rows.itertuples(index=False)
+        )
+        raise UserFacingError(
+            "Ticker classification file has invalid asset_class values.",
+            "Use asset_class values `ETF` or `Equity`.\nExamples:\n" + preview,
+        )
+
+    out = out[out["instrument_id"] != ""].copy()
+    if out.empty:
+        raise UserFacingError(
+            "Ticker classification file has no usable rows.",
+            "Ensure ticker_classification_complete.csv has non-empty `instrument_id` values.",
+        )
+    return out.reset_index(drop=True)
 
 
 def resolve_instrument_mapping(
     *,
     portfolio: pd.DataFrame,
     transactions: pd.DataFrame,
-    mappings: dict[str, dict[str, Any]],
+    classifications: pd.DataFrame,
 ) -> pd.DataFrame:
     base_cols = ["instrument_id", "product", "isin", "symbol", "currency"]
     from_pf = portfolio[base_cols].copy()
@@ -1130,23 +1154,35 @@ def resolve_instrument_mapping(
     merged["is_cash_like"] = is_cash_like(merged["product"], merged["isin"])
     merged["ticker"] = merged["symbol"].where(~merged["symbol"].astype(str).str.match(r"^[A-Z]{2}[A-Z0-9]{10}$"))
 
-    symbol_map = mappings.get("symbols", {})
-    currency_map = mappings.get("currencies", {})
-    is_etf_map = mappings.get("is_etf", {})
-    is_not_etf_map = mappings.get("is_not_etf", {})
+    merged["asset_class"] = ""
+    merged["primary_style"] = ""
+    merged["secondary_factor"] = ""
+    merged["gics_sector"] = ""
+    merged["gics_industry_group"] = ""
+    merged["gics_industry"] = ""
+    merged["gics_sub_industry"] = ""
 
-    for idx in merged.index:
-        isin = str(merged.at[idx, "isin"]).upper() if pd.notna(merged.at[idx, "isin"]) else ""
-        product_key = str(merged.at[idx, "product"]).upper()
-        if pd.isna(merged.at[idx, "ticker"]) or str(merged.at[idx, "ticker"]).strip() == "":
-            mapped = symbol_map.get(isin) or symbol_map.get(product_key)
-            if mapped:
-                merged.at[idx, "ticker"] = str(mapped).strip()
-
-        if pd.isna(merged.at[idx, "currency"]) or str(merged.at[idx, "currency"]).strip() == "":
-            mapped_cur = currency_map.get(isin) or currency_map.get(product_key)
-            if mapped_cur:
-                merged.at[idx, "currency"] = str(mapped_cur).strip().upper()
+    by_instrument_id: dict[str, dict[str, str]] = {}
+    by_ticker: dict[str, dict[str, str]] = {}
+    for row in classifications.itertuples(index=False):
+        record = {
+            "instrument_id": _clean_text_local(getattr(row, "instrument_id", "")).upper(),
+            "ticker": _clean_text_local(getattr(row, "ticker", "")).upper(),
+            "currency": _clean_text_local(getattr(row, "currency", "")).upper(),
+            "asset_class": _normalize_asset_class_text(getattr(row, "asset_class", "")),
+            "primary_style": _clean_text_local(getattr(row, "primary_style", "")),
+            "secondary_factor": _clean_text_local(getattr(row, "secondary_factor", "")),
+            "gics_sector": _clean_text_local(getattr(row, "gics_sector", "")),
+            "gics_industry_group": _clean_text_local(getattr(row, "gics_industry_group", "")),
+            "gics_industry": _clean_text_local(getattr(row, "gics_industry", "")),
+            "gics_sub_industry": _clean_text_local(getattr(row, "gics_sub_industry", "")),
+        }
+        instrument_key = _normalize_lookup_key(record["instrument_id"])
+        ticker_key = _normalize_lookup_key(record["ticker"])
+        if instrument_key and instrument_key not in by_instrument_id:
+            by_instrument_id[instrument_key] = record
+        if ticker_key and ticker_key not in by_ticker:
+            by_ticker[ticker_key] = record
 
     heuristic_etf = merged["product"].fillna("").str.contains(
         r"(?:ETF|UCITS|ISHARES|VANGUARD|SPDR|VANECK)",
@@ -1156,69 +1192,94 @@ def resolve_instrument_mapping(
     merged["is_etf"] = heuristic_etf
     merged["is_not_etf"] = False
     missing_classification: list[str] = []
+    missing_ticker: list[str] = []
     for idx in merged.index:
+        is_cash_like_row = bool(merged.at[idx, "is_cash_like"])
+        if is_cash_like_row:
+            continue
+
+        instrument_id = _clean_text_local(merged.at[idx, "instrument_id"]).upper()
         isin = str(merged.at[idx, "isin"]).upper() if pd.notna(merged.at[idx, "isin"]) else ""
-        product_key = str(merged.at[idx, "product"]).upper()
-        mapped_etf_value = is_etf_map.get(isin, is_etf_map.get(product_key))
-        mapped_not_etf_value = is_not_etf_map.get(isin, is_not_etf_map.get(product_key))
+        ticker = _clean_text_local(merged.at[idx, "ticker"]).upper()
+        product = _clean_text_local(merged.at[idx, "product"])
 
-        has_etf = mapped_etf_value is not None
-        has_not_etf = mapped_not_etf_value is not None
-        if has_etf and has_not_etf and _as_bool(mapped_etf_value) and _as_bool(mapped_not_etf_value):
-            raise UserFacingError(
-                "Conflicting ETF classification in mappings.yml.",
-                f"Instrument {merged.at[idx, 'product']} ({isin or product_key}) is marked as both "
-                "`is_etf` and `is_not_etf`. Keep only one explicit classification.",
-            )
-        if has_etf:
-            merged.at[idx, "is_etf"] = _as_bool(mapped_etf_value)
-        if has_not_etf:
-            merged.at[idx, "is_etf"] = not _as_bool(mapped_not_etf_value)
+        match = by_instrument_id.get(_normalize_lookup_key(instrument_id))
+        if match is None and isin != "":
+            match = by_instrument_id.get(_normalize_lookup_key(isin))
+        if match is None and ticker != "":
+            match = by_ticker.get(_normalize_lookup_key(ticker))
 
-        if (not has_etf) and (not has_not_etf) and (not bool(merged.at[idx, "is_cash_like"])):
-            identifier = isin or product_key
-            product_name = str(merged.at[idx, "product"]).strip()
+        if match is None:
+            identifier = isin or instrument_id or product.upper()
             missing_classification.append(
-                f"- Product: {product_name} | Identifier: {identifier} | "
-                "Add either `is_etf: true` or `is_not_etf: true` in mappings.yml."
+                f"- Product: {product} | Identifier: {identifier} | Add a row in ticker_classification_complete.csv"
             )
+            continue
 
-        merged.at[idx, "is_not_etf"] = not bool(merged.at[idx, "is_etf"])
+        mapped_ticker = _clean_text_local(match.get("ticker", "")).upper()
+        mapped_currency = _clean_text_local(match.get("currency", "")).upper()
+        mapped_asset_class = _normalize_asset_class_text(match.get("asset_class", ""))
+
+        if ticker == "" and mapped_ticker != "":
+            merged.at[idx, "ticker"] = mapped_ticker
+            ticker = mapped_ticker
+        if _clean_text_local(merged.at[idx, "currency"]) == "" and mapped_currency != "":
+            merged.at[idx, "currency"] = mapped_currency
+
+        merged.at[idx, "asset_class"] = mapped_asset_class
+        merged.at[idx, "primary_style"] = _clean_text_local(match.get("primary_style", ""))
+        merged.at[idx, "secondary_factor"] = _clean_text_local(match.get("secondary_factor", ""))
+        merged.at[idx, "gics_sector"] = _clean_text_local(match.get("gics_sector", ""))
+        merged.at[idx, "gics_industry_group"] = _clean_text_local(match.get("gics_industry_group", ""))
+        merged.at[idx, "gics_industry"] = _clean_text_local(match.get("gics_industry", ""))
+        merged.at[idx, "gics_sub_industry"] = _clean_text_local(match.get("gics_sub_industry", ""))
+        merged.at[idx, "is_etf"] = mapped_asset_class == "ETF"
+        merged.at[idx, "is_not_etf"] = mapped_asset_class == "Equity"
+
+        if ticker == "":
+            identifier = isin or instrument_id or product.upper()
+            missing_ticker.append(
+                f"- Product: {product} | Identifier: {identifier} | Set a non-empty `ticker` in ticker_classification_complete.csv"
+            )
 
     # Cash-like rows should not be treated as ETF/non-ETF holdings.
     merged.loc[merged["is_cash_like"], "is_etf"] = False
     merged.loc[merged["is_cash_like"], "is_not_etf"] = False
+    merged.loc[merged["is_cash_like"], "asset_class"] = "Cash"
 
     if missing_classification:
         raise UserFacingError(
-            "ETF classification is incomplete for one or more instruments.",
-            "Every non-cash holding must be explicitly classified in mappings.yml under "
-            "`is_etf` or `is_not_etf`.\n" + "\n".join(missing_classification),
+            "Ticker classification is incomplete for one or more instruments.",
+            "Every non-cash holding must be present in ticker_classification_complete.csv.\n"
+            + "\n".join(missing_classification),
         )
 
-    ticker_blank = merged["ticker"].isna() | merged["ticker"].astype(str).str.strip().isin({"", "nan", "None"})
-    unresolved = merged[(~merged["is_cash_like"]) & ticker_blank]
-    if not unresolved.empty:
-        lines = []
-        for row in unresolved.itertuples(index=False):
-            identifier = row.isin if pd.notna(row.isin) and str(row.isin) else row.product
-            product_name = str(row.product).strip() if pd.notna(row.product) else "(missing product name)"
-            lines.append(
-                f"- Product: {product_name} | Identifier: {identifier} | "
-                f"Yahoo lookup: https://finance.yahoo.com/ (search '{product_name}')"
-            )
+    if missing_ticker:
         raise UserFacingError(
             "Ticker mapping is incomplete for one or more instruments.",
-            "Edit mappings.yml and add entries under `symbols`.\n"
-            "Use the product names below to search Yahoo Finance for the correct ticker.\n"
-            + "\n".join(lines),
+            "Set a `ticker` value for each listed row in ticker_classification_complete.csv.\n"
+            + "\n".join(missing_ticker),
         )
 
     return merged
 
 
 def attach_instrument_metadata(df: pd.DataFrame, instruments: pd.DataFrame) -> pd.DataFrame:
-    cols = ["instrument_id", "ticker", "currency", "is_etf", "is_not_etf", "is_cash_like"]
+    cols = [
+        "instrument_id",
+        "ticker",
+        "currency",
+        "is_etf",
+        "is_not_etf",
+        "is_cash_like",
+        "asset_class",
+        "primary_style",
+        "secondary_factor",
+        "gics_sector",
+        "gics_industry_group",
+        "gics_industry",
+        "gics_sub_industry",
+    ]
     merged = df.merge(instruments[cols], on="instrument_id", how="left", suffixes=("", "_instrument"))
     if "currency_instrument" in merged.columns:
         merged["currency"] = merged["currency"].fillna(merged["currency_instrument"])
@@ -1308,42 +1369,26 @@ def validate_critical_columns(
     return warnings, issues
 
 
-def _to_upper_key_dict(mapping: dict[Any, Any]) -> dict[str, Any]:
-    return {str(k).upper(): v for k, v in mapping.items()}
+def _normalize_asset_class_text(value: Any) -> str:
+    txt = _clean_text_local(value).upper()
+    if txt == "ETF":
+        return "ETF"
+    if txt in {"EQUITY", "STOCK"}:
+        return "Equity"
+    return ""
 
 
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y"}:
-        return True
-    if text in {"0", "false", "no", "n"}:
-        return False
-    return bool(value)
+def _normalize_lookup_key(value: Any) -> str:
+    return _clean_text_local(value).upper()
 
 
-def _validate_boolean_section(section: dict[Any, Any], section_name: str) -> None:
-    for raw_key, raw_value in section.items():
-        if isinstance(raw_value, bool):
-            continue
-        if isinstance(raw_value, (int, float)) and raw_value in {0, 1}:
-            continue
-        if isinstance(raw_value, str) and raw_value.strip().lower() in {
-            "true",
-            "false",
-            "yes",
-            "no",
-            "1",
-            "0",
-        }:
-            continue
-        raise UserFacingError(
-            f"mappings.yml section `{section_name}` has invalid boolean value.",
-            f"Key `{raw_key}` has value `{raw_value}`. Use true/false.",
-        )
+def _clean_text_local(value: Any) -> str:
+    if value is None:
+        return ""
+    txt = str(value).strip()
+    if txt.lower() in {"", "nan", "none"}:
+        return ""
+    return txt
 
 
 def _append_row_issue_warning(

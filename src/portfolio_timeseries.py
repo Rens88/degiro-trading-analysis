@@ -83,6 +83,40 @@ def get_cache_runtime_state(*, cache_dir: str = "cache") -> dict[str, Any]:
     return state
 
 
+def get_price_cache_last_update(
+    *,
+    cache_dir: str = "cache",
+    tickers: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> datetime | None:
+    path = _cache_meta_path(cache_dir)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            tickers_map = data.get("tickers", {})
+            candidates: list[datetime] = []
+            if isinstance(tickers_map, dict):
+                if tickers is None:
+                    raw_values = list(tickers_map.values())
+                else:
+                    requested = {str(t).strip() for t in tickers if str(t).strip() != ""}
+                    raw_values = [tickers_map.get(t) for t in requested]
+                for raw in raw_values:
+                    ts = pd.to_datetime(raw, errors="coerce")
+                    if pd.notna(ts):
+                        candidates.append(ts.to_pydatetime().replace(tzinfo=None))
+            if candidates:
+                return max(candidates)
+
+            raw_last = data.get("last_online_fetch_at")
+            ts_last = pd.to_datetime(raw_last, errors="coerce")
+            if pd.notna(ts_last):
+                return ts_last.to_pydatetime().replace(tzinfo=None)
+    return _read_last_online_fetch_timestamp(cache_dir=cache_dir)
+
+
 def _is_yahoo_reachable(timeout_seconds: float = 1.5) -> bool:
     if yf is None:
         return False
@@ -121,6 +155,7 @@ def compute_portfolio_timeseries(
     account: pd.DataFrame,
     instruments: pd.DataFrame,
     expected_latest_cash_eur: float | None = None,
+    end_date_override: pd.Timestamp | date | datetime | str | None = None,
     cache_dir: str = "cache",
     logger: logging.Logger | None = None,
 ) -> TimeSeriesResult:
@@ -143,6 +178,10 @@ def compute_portfolio_timeseries(
         transactions["datetime"].dropna().max().normalize(),
         account["datetime"].dropna().max().normalize() if not account.empty else start_date,
     )
+    if end_date_override is not None:
+        override_ts = pd.to_datetime(end_date_override, errors="coerce")
+        if pd.notna(override_ts):
+            end_date = max(end_date, pd.Timestamp(override_ts).normalize())
     daily_index = pd.date_range(start=start_date, end=end_date, freq="D")
 
     positions = build_daily_positions(
@@ -162,8 +201,8 @@ def compute_portfolio_timeseries(
     shared_cols = [c for c in positions.columns if c in prices_eur.columns]
     if not shared_cols:
         raise UserFacingError(
-            "No instruments could be priced from the configured mappings.",
-            "Add missing ticker mappings in mappings.yml under `symbols`.",
+            "No instruments could be priced from the configured classification data.",
+            "Add or fix ticker values in ticker_classification_complete.csv.",
         )
 
     positions = positions[shared_cols]
@@ -759,7 +798,7 @@ def fetch_price_series(
         elif cached.empty:
             raise UserFacingError(
                 f"Could not fetch price history for {ticker}.",
-                "Check internet connection, ticker validity, and mappings.yml.",
+                "Check internet connection, ticker validity, and ticker_classification_complete.csv.",
             )
         else:
             _mark_offline_cache_usage(cache_dir=cache_dir, ticker=ticker, cache_path=cache_path)

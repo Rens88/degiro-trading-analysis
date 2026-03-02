@@ -11,15 +11,37 @@ from pandas.testing import assert_frame_equal
 from src.data_import import (
     infer_account_type,
     is_cash_like,
+    load_classification_catalog,
     load_csv_generic,
     load_dataset,
-    load_mappings,
     normalize_account,
     normalize_transactions,
     resolve_instrument_mapping,
     validate_critical_columns,
 )
 from src.exceptions import UserFacingError
+
+
+def _classification_df(rows: list[dict[str, str]]) -> pd.DataFrame:
+    defaults = {
+        "instrument_id": "",
+        "ticker": "",
+        "product": "",
+        "currency": "",
+        "asset_class": "",
+        "primary_style": "",
+        "secondary_factor": "",
+        "gics_sector": "",
+        "gics_industry_group": "",
+        "gics_industry": "",
+        "gics_sub_industry": "",
+    }
+    out_rows: list[dict[str, str]] = []
+    for row in rows:
+        item = defaults.copy()
+        item.update(row)
+        out_rows.append(item)
+    return pd.DataFrame(out_rows, columns=list(defaults.keys()))
 
 
 def test_transactions_normalization_comma_separator_english_headers() -> None:
@@ -228,16 +250,29 @@ def test_missing_ticker_error_contains_product_name() -> None:
         ]
     )
     transactions = portfolio.copy()
-    mappings = {"symbols": {}, "currencies": {}, "is_etf": {}, "is_not_etf": {}}
+    classifications = _classification_df(
+        [
+            {
+                "instrument_id": "DE0005552004",
+                "ticker": "",
+                "currency": "EUR",
+                "asset_class": "Equity",
+            }
+        ]
+    )
 
     try:
-        resolve_instrument_mapping(portfolio=portfolio, transactions=transactions, mappings=mappings)
+        resolve_instrument_mapping(
+            portfolio=portfolio,
+            transactions=transactions,
+            classifications=classifications,
+        )
         raise AssertionError("Expected UserFacingError due to missing ticker mapping.")
     except UserFacingError as exc:
         text = exc.to_ui_text()
         assert "DEUTSCHE POST AG" in text
         assert "DE0005552004" in text
-        assert "Yahoo" in text
+        assert "ticker_classification_complete.csv" in text
 
 
 def test_is_not_etf_explicit_override() -> None:
@@ -254,13 +289,21 @@ def test_is_not_etf_explicit_override() -> None:
         ]
     )
     transactions = portfolio.copy()
-    mappings = {
-        "symbols": {"NL0012345678": "TEST.AS"},
-        "currencies": {},
-        "is_etf": {},
-        "is_not_etf": {"NL0012345678": True},
-    }
-    out = resolve_instrument_mapping(portfolio=portfolio, transactions=transactions, mappings=mappings)
+    classifications = _classification_df(
+        [
+            {
+                "instrument_id": "NL0012345678",
+                "ticker": "TEST.AS",
+                "currency": "EUR",
+                "asset_class": "Equity",
+            }
+        ]
+    )
+    out = resolve_instrument_mapping(
+        portfolio=portfolio,
+        transactions=transactions,
+        classifications=classifications,
+    )
     assert bool(out.loc[0, "is_etf"]) is False
     assert bool(out.loc[0, "is_not_etf"]) is True
 
@@ -279,31 +322,38 @@ def test_missing_is_etf_or_is_not_etf_raises_error() -> None:
         ]
     )
     transactions = portfolio.copy()
-    mappings = {
-        "symbols": {"US0000000001": "TEST"},
-        "currencies": {"US0000000001": "USD"},
-        "is_etf": {},
-        "is_not_etf": {},
-    }
+    classifications = _classification_df([])
 
     try:
-        resolve_instrument_mapping(portfolio=portfolio, transactions=transactions, mappings=mappings)
+        resolve_instrument_mapping(
+            portfolio=portfolio,
+            transactions=transactions,
+            classifications=classifications,
+        )
         raise AssertionError("Expected classification error for missing is_etf/is_not_etf entry.")
     except UserFacingError as exc:
         text = exc.to_ui_text()
-        assert "ETF classification is incomplete" in text
+        assert "classification is incomplete" in text.lower()
         assert "US0000000001" in text
         assert "TEST STOCK" in text
 
 
-def test_load_mappings_invalid_yaml_syntax_raises_user_error(tmp_path) -> None:
-    path = tmp_path / "mappings.yml"
-    path.write_text("symbols:\n  A: B\nis_etf: [oops\n", encoding="utf-8")
+def test_load_classification_catalog_invalid_asset_class_raises_user_error(tmp_path) -> None:
+    path = tmp_path / "ticker_classification_complete.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "instrument_id,ticker,product,currency,asset_class,primary_style,secondary_factor,gics_sector,gics_industry_group,gics_industry,gics_sub_industry",
+                "ID1,AAA,Example,EUR,INVALID,Growth,Quality,IT,Software,Software,Software",
+            ]
+        ),
+        encoding="utf-8",
+    )
     try:
-        load_mappings(path)
-        raise AssertionError("Expected syntax validation error.")
+        load_classification_catalog(path)
+        raise AssertionError("Expected invalid asset_class validation error.")
     except UserFacingError as exc:
-        assert "invalid YAML syntax" in exc.to_ui_text()
+        assert "invalid asset_class" in exc.to_ui_text()
 
 
 def test_is_cash_like_does_not_mark_etf_with_eur_in_name() -> None:
@@ -414,14 +464,14 @@ def test_broken_datasets_import_same_as_clean(clean_name: str, broken_name: str)
         transactions_source=clean_base / "Transactions.csv",
         portfolio_source=clean_base / "Portfolio.csv",
         account_source=clean_base / "Account.csv",
-        mappings_path="mappings.yml",
+        classification_path="ticker_classification_complete.csv",
     )
     broken = load_dataset(
         account_label=broken_name,
         transactions_source=broken_base / "Transactions.csv",
         portfolio_source=broken_base / "Portfolio.csv",
         account_source=broken_base / "Account.csv",
-        mappings_path="mappings.yml",
+        classification_path="ticker_classification_complete.csv",
     )
 
     assert_frame_equal(

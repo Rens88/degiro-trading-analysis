@@ -1,0 +1,32 @@
+
+
+***********
+SUPERTASK 1
+I've come to an updated CSV format: ticker_classification_complete.csv
+DO Fill out empty cells in the csv uploaded to this message. 
+DO Double check each entry again, as I noticed some errors (most of the ETFs were still assigend asset_class Equity..). 
+DO Check line by line for correctness
+DONT change column order 
+DONT change column names
+
+Stick to: 
+Primary Style: Growth Value Blend Dividend 
+Secondary Factor (optional): Quality Momentum Cyclical Defensive 
+NOTE: No double styles / factors 
+
+TASK Generate a downloadable filled out and double checked csv file.
+
+
+***********
+SUPERTASK 2
+
+after completing "supertask 1", the info from mappings.yml is combined with the original ticker_classification.csv info in ticker_classification_complete.csv. Some of the column names have been updated as well. HOldings are categorized slightly differently using Global Industry Classification Standard (GICS®).
+
+TASK 1: Combine mappings.yml with ticker_classifications.csv to create one source of truth for ticker characteristics.
+TASK 2: Update the app so it no longer uses mappings.yml, but uses ticker_classification_complete.csv.
+TASK 3: Update all uses of the old columns from ticker_classification.csv to use the new columns in ticker_classification_complete.csv.
+TASK 4: Update currency/industry/style in section 6 so it shows the new categorizations (currency, asset_class, primary_style, secondary_factor, gics_sector, gics_industry_group, gics_industry, gics_sub_industry).
+TASK 5: Add to section 6 a tab with pie charts of: currency, asset_clas,primary_style, secondary_factor, gics_sector, gics_industry_group, gics_industry, gics_sub_industry.
+
+
+

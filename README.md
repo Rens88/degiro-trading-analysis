@@ -72,19 +72,18 @@ If two datasets are loaded:
 - shows Combined totals
 - verifies `A total + B total = combined total`
 
-## Mapping Missing Instruments (`mappings.yml`)
+## Instrument Classification (`ticker_classification_complete.csv`)
 
-Ticker and metadata resolution uses `mappings.yml`:
+Ticker and metadata resolution uses `ticker_classification_complete.csv` as the
+single source of truth:
 
-- `symbols`: ISIN/product -> yfinance ticker
-- `currencies`: ISIN/product -> currency code
-- `is_etf`: ISIN/product -> ETF classification override
+- `ticker`, `currency`, and `asset_class` are used during ingestion.
+- `primary_style`, `secondary_factor`, and `gics_*` columns are used in spread
+  analysis and Section 6 allocation views.
 
-If mapping is missing, the app raises a user-facing error listing:
-
-- affected instrument(s)
-- missing identifier
-- exact fix path (`mappings.yml` under `symbols`)
+If a row is missing, the app raises a user-facing error listing the affected
+instrument(s) and asks you to add the row in
+`ticker_classification_complete.csv`.
 
 ## Tests
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from .config import (
     DEFAULT_STRATEGY_DATASET_A_DIR,
     DEFAULT_STRATEGY_DATASET_B_DIR,
     DEFAULT_STRATEGY_FILE_PATH,
+    DEFAULT_TICKER_CLASSIFICATION_PATH,
     DEFAULT_TARGET_CURRENCY_PCT,
     DEFAULT_TARGET_CASH_PCT,
     DEFAULT_TARGET_ETF_FRACTION,
@@ -48,12 +50,18 @@ from .config import (
 from .data_import import LoadedDataset, load_dataset
 from .exceptions import UserFacingError
 from .logging_utils import setup_logger
-from .portfolio_timeseries import compute_portfolio_timeseries, latest_fx_rate
+from .portfolio_timeseries import (
+    compute_portfolio_timeseries,
+    get_price_cache_last_update,
+    latest_fx_rate,
+)
 from .reconciliation import TotalsResult, combine_totals, reconcile_dataset
 
 
 # Exit code used by the startup BAT script to decide whether to launch Streamlit.
 EXIT_ACTION_REQUIRED = 10
+# Exit code used when source portfolio exports are internally inconsistent.
+EXIT_DATA_WARNING = 11
 
 
 @dataclass
@@ -61,7 +69,7 @@ class ResolvedConfig:
     strategy_file: Path
     dataset_a_dir: Path
     dataset_b_dir: Path
-    mappings_path: Path
+    classification_path: Path
     strategy: dict[str, Any]
 
 
@@ -70,15 +78,25 @@ def main() -> int:
     logger = setup_logger("logs/strategy_check.log")
     try:
         cfg = resolve_config(args)
-        datasets = load_datasets(cfg)
+        datasets, portfolio_sources = load_datasets(cfg)
         if not datasets:
             print("No dataset could be loaded. Nothing to check.")
             return 2
+        naming_conflicts = _detect_portfolio_product_name_conflicts(
+            datasets=datasets,
+            portfolio_sources=portfolio_sources,
+        )
+        print(
+            "[INFO] Portfolio name consistency check: "
+            f"{len(naming_conflicts)} conflict(s) detected."
+        )
+        if naming_conflicts:
+            _print_portfolio_product_name_conflicts(naming_conflicts)
+            return EXIT_DATA_WARNING
 
         report = evaluate_strategy(
             datasets=datasets,
             strategy=cfg.strategy,
-            mappings_path=cfg.mappings_path,
             logger=logger,
         )
         _print_strategy_report(report)
@@ -122,9 +140,9 @@ def _parse_args() -> argparse.Namespace:
         help="Directory containing Dataset B CSV exports.",
     )
     parser.add_argument(
-        "--mappings-path",
+        "--classification-path",
         default=None,
-        help="Path to mappings.yml.",
+        help="Path to ticker_classification_complete.csv.",
     )
     return parser.parse_args()
 
@@ -135,10 +153,22 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
         strategy_path = Path.cwd() / strategy_path
 
     loaded = {}
+    strategy_file_found = strategy_path.exists()
     if strategy_path.exists():
         loaded = _load_strategy_file(strategy_path)
 
-    strategy = _strategy_with_defaults(loaded.get("strategy", {}))
+    raw_strategy = loaded.get("strategy", {}) if isinstance(loaded.get("strategy", {}), dict) else {}
+    strategy = _strategy_with_defaults(raw_strategy)
+    raw_target_cash_pct = raw_strategy.get("target_cash_pct", "<missing>")
+    print(f"[INFO] Strategy file resolved to: {strategy_path}")
+    if not strategy_file_found:
+        print("[WARN] Strategy file not found; using default strategy values.")
+    print(
+        "[INFO] Strategy target_cash_pct: "
+        f"raw={raw_target_cash_pct!r}, "
+        f"resolved={strategy['target_cash_pct']!r}, "
+        f"default={DEFAULT_TARGET_CASH_PCT!r}"
+    )
     data_sources = loaded.get("data_sources", {}) if isinstance(loaded.get("data_sources", {}), dict) else {}
 
     dataset_a_dir = _resolve_path(
@@ -151,50 +181,129 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
         fallback=data_sources.get("dataset_b_dir"),
         default=str(DEFAULT_STRATEGY_DATASET_B_DIR),
     )
-    mappings_path = _resolve_path(
-        preferred=getattr(args, "mappings_path", None),
-        fallback=data_sources.get("mappings_path"),
-        default="mappings.yml",
+    preferred_classification = getattr(args, "classification_path", None)
+    classification_path = _resolve_path(
+        preferred=preferred_classification,
+        fallback=data_sources.get("classification_path"),
+        default=str(DEFAULT_TICKER_CLASSIFICATION_PATH),
     )
 
     return ResolvedConfig(
         strategy_file=strategy_path,
         dataset_a_dir=dataset_a_dir,
         dataset_b_dir=dataset_b_dir,
-        mappings_path=mappings_path,
+        classification_path=classification_path,
         strategy=strategy,
     )
 
 
-def load_datasets(cfg: ResolvedConfig) -> dict[str, LoadedDataset]:
+def load_datasets(cfg: ResolvedConfig) -> tuple[dict[str, LoadedDataset], dict[str, Path]]:
     datasets: dict[str, LoadedDataset] = {}
+    portfolio_sources: dict[str, Path] = {}
     for panel, folder in [("dataset_a", cfg.dataset_a_dir), ("dataset_b", cfg.dataset_b_dir)]:
         if not _has_required_files(folder):
             print(f"Skipping {panel}: required files not found in {folder}")
             continue
         label = f"{panel.replace('_', ' ').title()} ({folder.name})"
+        portfolio_source = folder / "Portfolio.csv"
         ds = load_dataset(
             account_label=label,
             transactions_source=folder / "Transactions.csv",
-            portfolio_source=folder / "Portfolio.csv",
+            portfolio_source=portfolio_source,
             account_source=folder / "Account.csv",
-            mappings_path=cfg.mappings_path,
+            classification_path=cfg.classification_path,
         )
         datasets[panel] = ds
-    return datasets
+        portfolio_sources[label] = portfolio_source.resolve()
+    return datasets, portfolio_sources
+
+
+def _detect_portfolio_product_name_conflicts(
+    *,
+    datasets: dict[str, LoadedDataset],
+    portfolio_sources: dict[str, Path],
+) -> list[dict[str, Any]]:
+    rows: list[pd.DataFrame] = []
+    for dataset in datasets.values():
+        portfolio = dataset.portfolio
+        if portfolio is None or portfolio.empty:
+            continue
+        frame = portfolio.copy()
+        frame["account_label"] = dataset.account_label
+        frame["instrument_id"] = frame.get("instrument_id", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+        frame["ticker"] = frame.get("ticker", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+        frame["product"] = frame.get("product", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+        if "is_cash_like" in frame.columns:
+            frame = frame.loc[~frame["is_cash_like"].fillna(False)].copy()
+        frame = frame.loc[frame["instrument_id"].ne("") & frame["product"].ne("")].copy()
+        if frame.empty:
+            continue
+        frame = frame[["account_label", "instrument_id", "ticker", "product"]].drop_duplicates().copy()
+        source_path = portfolio_sources.get(dataset.account_label)
+        frame["portfolio_source"] = str(source_path) if source_path is not None else "Portfolio.csv (unknown source)"
+        frame["product_norm"] = frame["product"].map(lambda v: " ".join(str(v).split()).casefold())
+        rows.append(frame)
+
+    if not rows:
+        return []
+    merged = pd.concat(rows, ignore_index=True)
+
+    conflicts: list[dict[str, Any]] = []
+    grouped = merged.groupby("instrument_id", dropna=False, as_index=False)
+    for _, block in grouped:
+        unique_norm = sorted({str(v).strip() for v in block["product_norm"].dropna().astype(str) if str(v).strip() != ""})
+        if len(unique_norm) <= 1:
+            continue
+        ticker_values = sorted({str(v).strip() for v in block["ticker"].dropna().astype(str) if str(v).strip() != ""})
+        rows_out: list[dict[str, str]] = []
+        for row in block[["account_label", "portfolio_source", "product"]].drop_duplicates().itertuples(index=False):
+            rows_out.append(
+                {
+                    "account_label": str(getattr(row, "account_label", "")),
+                    "portfolio_source": str(getattr(row, "portfolio_source", "")),
+                    "product": str(getattr(row, "product", "")),
+                }
+            )
+        rows_out = sorted(rows_out, key=lambda item: (item["portfolio_source"], item["account_label"], item["product"]))
+        conflicts.append(
+            {
+                "instrument_id": str(block["instrument_id"].iloc[0]),
+                "ticker": ticker_values[0] if ticker_values else "",
+                "rows": rows_out,
+            }
+        )
+    return conflicts
+
+
+def _print_portfolio_product_name_conflicts(conflicts: list[dict[str, Any]]) -> None:
+    print("")
+    print("[WARN] Inconsistent product names detected for the same instrument across portfolio exports.")
+    for conflict in conflicts:
+        instrument_id = str(conflict.get("instrument_id", "")).strip()
+        ticker = str(conflict.get("ticker", "")).strip()
+        header = f"[WARN] Instrument {instrument_id}"
+        if ticker != "":
+            header += f" (ticker {ticker})"
+        print(header)
+        for row in conflict.get("rows", []):
+            source_path = str(row.get("portfolio_source", "")).strip()
+            product = str(row.get("product", "")).strip()
+            account_label = str(row.get("account_label", "")).strip()
+            print(f"[WARN]   Source file: {source_path}")
+            if account_label != "":
+                print(f"[WARN]   Dataset    : {account_label}")
+            print(f"[WARN]   Product    : {product}")
+    print("[WARN] Recommendation: re-download the listed Portfolio.csv file(s) and rerun run_strategy_check_startup.bat.")
 
 
 def evaluate_strategy(
     *,
     datasets: dict[str, LoadedDataset],
     strategy: dict[str, Any],
-    mappings_path: Path,
     logger: Any,
 ) -> dict[str, Any]:
     # AGENT_NOTE: This mirrors app-level spread logic but returns compact action
     # tables for startup gating. Keep in sync with `app.py` strategy parameters.
-    del mappings_path  # kept for forward compatibility
-
     totals_results: dict[str, TotalsResult] = {}
     merged_portfolio = pd.concat([d.portfolio for d in datasets.values()], ignore_index=True)
     merged_transactions = pd.concat([d.transactions for d in datasets.values()], ignore_index=True)
@@ -218,16 +327,38 @@ def evaluate_strategy(
     ts_result = None
     prices_eur = pd.DataFrame()
     metrics_df = pd.DataFrame()
+    ticker_last_update: pd.Timestamp | None = None
     try:
         ts_result = compute_portfolio_timeseries(
             transactions=merged_transactions,
             account=merged_account,
             instruments=merged_instruments,
+            end_date_override=pd.Timestamp(date.today()).normalize(),
             cache_dir="cache",
             logger=logger,
         )
         prices_eur = ts_result.prices_eur
         metrics_df = ts_result.metrics
+
+        tickers_for_updates: list[str] = []
+        if not prices_eur.empty:
+            id_to_ticker = (
+                merged_instruments[["instrument_id", "ticker"]]
+                .copy()
+                .drop_duplicates(subset=["instrument_id"], keep="first")
+                .set_index("instrument_id")["ticker"]
+                .to_dict()
+            )
+            for instrument_id in prices_eur.columns:
+                ticker = str(id_to_ticker.get(str(instrument_id), "")).strip()
+                if ticker != "":
+                    tickers_for_updates.append(ticker)
+        raw_last_update = get_price_cache_last_update(
+            cache_dir="cache",
+            tickers=tickers_for_updates if tickers_for_updates else None,
+        )
+        if raw_last_update is not None:
+            ticker_last_update = pd.Timestamp(raw_last_update)
     except Exception:
         # Startup check keeps working without time-series data.
         prices_eur = pd.DataFrame()
@@ -244,7 +375,7 @@ def evaluate_strategy(
         cost_basis_map=cost_basis,
     )
 
-    growth_df = _build_growth_table(metrics_df)
+    growth_df = _build_growth_table(metrics_df, ticker_last_update=ticker_last_update)
     non_etf_df = holdings_df.loc[~holdings_df["is_etf"]].copy()
     etf_df = holdings_df.loc[holdings_df["is_etf"]].copy()
     non_etf_df["portfolio_pct"] = pd.to_numeric(non_etf_df.get("value_pct"), errors="coerce")
@@ -336,11 +467,16 @@ def _print_strategy_report(report: dict[str, Any]) -> None:
     print(_format_table(trim_actions_df))
 
 
-def _build_growth_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
+def _build_growth_table(
+    metrics_df: pd.DataFrame,
+    *,
+    ticker_last_update: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     cols = [
         "period",
         "start_date",
         "end_date",
+        "ticker_last_update",
         "start_eur",
         "end_eur",
         "deposited_cash_eur",
@@ -366,6 +502,11 @@ def _build_growth_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
     end_dt = pd.Timestamp(series.index.max())
     end_val = float(series.iloc[-1])
     month_start = end_dt.to_period("M").to_timestamp(how="start")
+    ticker_last_update_text = (
+        pd.Timestamp(ticker_last_update).strftime("%Y-%m-%d %H:%M:%S")
+        if ticker_last_update is not None and pd.notna(ticker_last_update)
+        else ""
+    )
 
     def _deposited_between(start_dt: pd.Timestamp, end_dt_local: pd.Timestamp) -> float:
         if deposits.empty:
@@ -397,6 +538,7 @@ def _build_growth_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "period": label,
                 "start_date": pd.Timestamp(start_dt).strftime("%Y-%m-%d"),
                 "end_date": end_dt.strftime("%Y-%m-%d"),
+                "ticker_last_update": ticker_last_update_text,
                 "start_eur": start_val,
                 "end_eur": end_val,
                 "deposited_cash_eur": deposited,
@@ -420,6 +562,7 @@ def _build_growth_table(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "period": "MTD",
                 "start_date": pd.Timestamp(mtd_start_dt).strftime("%Y-%m-%d"),
                 "end_date": end_dt.strftime("%Y-%m-%d"),
+                "ticker_last_update": ticker_last_update_text,
                 "start_eur": mtd_start_val,
                 "end_eur": end_val,
                 "deposited_cash_eur": mtd_deposited,
@@ -767,9 +910,6 @@ def _strategy_with_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             data.get("target_style_pct"),
             default=DEFAULT_TARGET_STYLE_PCT,
         ),
-        "holding_category_overrides": _normalize_holding_category_overrides(
-            data.get("holding_category_overrides")
-        ),
     }
 
 
@@ -800,26 +940,6 @@ def _normalize_target_pct_map(raw: Any, *, default: dict[str, float] | None = No
             continue
         if pd.notna(pct):
             out[label] = max(float(pct), 0.0)
-    return out
-
-
-def _normalize_holding_category_overrides(raw: Any) -> dict[str, dict[str, str]]:
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, dict[str, str]] = {}
-    for key, value in raw.items():
-        instrument_id = str(key).strip()
-        if instrument_id == "" or not isinstance(value, dict):
-            continue
-        entry: dict[str, str] = {}
-        style = str(value.get("style", "")).strip()
-        industry = str(value.get("industry", "")).strip()
-        if style:
-            entry["style"] = style
-        if industry:
-            entry["industry"] = industry
-        if entry:
-            out[instrument_id] = entry
     return out
 
 

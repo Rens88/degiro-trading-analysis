@@ -19,7 +19,7 @@ def test_load_strategy_file_reads_target_cash_pct(tmp_path) -> None:
                 "data_sources": {
                     "dataset_a_dir": "data/a",
                     "dataset_b_dir": "data/b",
-                    "mappings_path": "mappings.yml",
+                    "classification_path": "ticker_classification_complete.csv",
                 },
             }
         ),
@@ -38,4 +38,4 @@ def test_load_strategy_file_reads_target_cash_pct(tmp_path) -> None:
     assert strategy["desired_non_etf_holdings"] == 10
     assert data_sources["dataset_a_dir"] == "data/a"
     assert data_sources["dataset_b_dir"] == "data/b"
-    assert data_sources["mappings_path"] == "mappings.yml"
+    assert data_sources["classification_path"] == "ticker_classification_complete.csv"

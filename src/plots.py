@@ -631,3 +631,170 @@ def build_cash_allocation_figure(metrics: pd.DataFrame, *, target_cash_pct: floa
         margin=dict(l=10, r=10, t=50, b=40),
     )
     return fig
+
+
+def build_allocation_pie_figure(
+    *,
+    allocation_df: pd.DataFrame,
+    category_col: str,
+    value_col: str,
+    title: str,
+) -> go.Figure:
+    fig = go.Figure()
+    if (
+        allocation_df is None
+        or allocation_df.empty
+        or category_col not in allocation_df.columns
+        or value_col not in allocation_df.columns
+    ):
+        fig.update_layout(template="plotly_white", title=f"No {title.lower()} data available")
+        return fig
+
+    data = allocation_df[[category_col, value_col]].copy()
+    data[category_col] = data[category_col].fillna("").astype(str).str.strip().replace("", "Unclassified")
+    data[value_col] = pd.to_numeric(data[value_col], errors="coerce").fillna(0.0)
+    data = data[data[value_col] > 0.0].copy()
+    if data.empty:
+        fig.update_layout(template="plotly_white", title=f"No {title.lower()} data available")
+        return fig
+
+    colors = [BASE_BLUE, BASE_ORANGE, BASE_GREEN, BASE_RED, BASE_YELLOW]
+    fig.add_trace(
+        go.Pie(
+            labels=data[category_col],
+            values=data[value_col],
+            hole=0.35,
+            sort=False,
+            marker=dict(colors=colors),
+            textinfo="label+percent",
+            hovertemplate="%{label}<br>EUR %{value:,.2f}<br>%{percent}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        margin=dict(l=10, r=10, t=50, b=20),
+        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
+    )
+    return fig
+
+
+def build_holdings_segment_pie_figure(
+    *,
+    holdings_df: pd.DataFrame,
+    title: str,
+    total_portfolio_value_eur: float | None = None,
+) -> go.Figure:
+    fig = go.Figure()
+    if holdings_df is None or holdings_df.empty or "value_eur" not in holdings_df.columns:
+        fig.update_layout(template="plotly_white", title=f"No {title.lower()} data available")
+        return fig
+
+    data = holdings_df.copy()
+    data["value_eur"] = pd.to_numeric(data["value_eur"], errors="coerce")
+    data = data[data["value_eur"] > 0.0].copy()
+    if data.empty:
+        fig.update_layout(template="plotly_white", title=f"No {title.lower()} data available")
+        return fig
+
+    portfolio_total = pd.to_numeric(total_portfolio_value_eur, errors="coerce")
+    if not np.isfinite(portfolio_total) or float(portfolio_total) <= 0.0:
+        portfolio_total = float(data["value_eur"].sum())
+    else:
+        portfolio_total = float(portfolio_total)
+    sleeve_total = float(data["value_eur"].sum())
+
+    ticker = (
+        data["ticker"].fillna("").astype(str).str.strip()
+        if "ticker" in data.columns
+        else pd.Series("", index=data.index)
+    )
+    product = (
+        data["product"].fillna("").astype(str).str.strip()
+        if "product" in data.columns
+        else pd.Series("", index=data.index)
+    )
+    isin = (
+        data["isin"].fillna("").astype(str).str.strip()
+        if "isin" in data.columns
+        else pd.Series("", index=data.index)
+    )
+    labels = ticker.where(ticker != "", product)
+    labels = labels.where(labels != "", isin)
+    labels = labels.where(labels != "", "Unlabeled holding")
+
+    if "is_over_target_threshold" in data.columns:
+        over_target_mask = data["is_over_target_threshold"].fillna(False).astype(bool)
+    elif "over_target_eur" in data.columns:
+        over_target_mask = pd.to_numeric(data["over_target_eur"], errors="coerce").fillna(0.0) > 0.0
+    else:
+        over_target_mask = pd.Series(False, index=data.index, dtype=bool)
+
+    over_target_eur = (
+        pd.to_numeric(data["over_target_eur"], errors="coerce").fillna(0.0)
+        if "over_target_eur" in data.columns
+        else pd.Series(0.0, index=data.index, dtype="float64")
+    )
+    status_text = np.where(over_target_mask.to_numpy(), "Above target threshold", "At/below target threshold")
+    portfolio_pct = np.where(
+        portfolio_total > 0.0,
+        data["value_eur"].to_numpy(dtype="float64") / portfolio_total * 100.0,
+        np.nan,
+    )
+    sleeve_pct = np.where(
+        sleeve_total > 0.0,
+        data["value_eur"].to_numpy(dtype="float64") / sleeve_total * 100.0,
+        np.nan,
+    )
+    label_pct_text = [f"{v:.2f}% portfolio" if np.isfinite(v) else "N/A" for v in portfolio_pct]
+    hover_text = [
+        (
+            f"{label}<br>"
+            f"EUR {value:,.2f}<br>"
+            f"Portfolio weight: {pf_pct:.2f}%<br>"
+            f"ETF/non-ETF sleeve weight: {seg_pct:.2f}%<br>"
+            f"Status: {status}<br>"
+            f"Over target: EUR {over:,.2f}"
+        )
+        for label, value, pf_pct, seg_pct, status, over in zip(
+            labels.tolist(),
+            data["value_eur"].to_numpy(dtype="float64"),
+            portfolio_pct,
+            sleeve_pct,
+            status_text.tolist(),
+            over_target_eur.to_numpy(dtype="float64"),
+        )
+    ]
+
+    normal_palette = [BASE_BLUE, BASE_ORANGE, BASE_GREEN, BASE_YELLOW]
+    colors: list[str] = []
+    normal_idx = 0
+    for is_over in over_target_mask.tolist():
+        if is_over:
+            colors.append(BASE_RED)
+        else:
+            colors.append(normal_palette[normal_idx % len(normal_palette)])
+            normal_idx += 1
+    pull = [0.10 if is_over else 0.0 for is_over in over_target_mask.tolist()]
+
+    fig.add_trace(
+        go.Pie(
+            labels=labels,
+            values=data["value_eur"],
+            hole=0.35,
+            sort=False,
+            pull=pull,
+            marker=dict(colors=colors, line=dict(color="white", width=1)),
+            text=label_pct_text,
+            textinfo="label+text",
+            hovertext=hover_text,
+            hovertemplate="%{hovertext}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        margin=dict(l=10, r=10, t=50, b=20),
+        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
+    )
+    return fig

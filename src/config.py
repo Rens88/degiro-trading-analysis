@@ -71,6 +71,7 @@ DEFAULT_MIN_TOTAL_HOLDINGS = 12
 DEFAULT_STRATEGY_FILE_PATH = Path("strategy/spread_strategy.json")
 DEFAULT_STRATEGY_DATASET_A_DIR = Path("data/pensioenbeleggen")
 DEFAULT_STRATEGY_DATASET_B_DIR = Path("data/spaarbeleggen")
+DEFAULT_TICKER_CLASSIFICATION_PATH = Path("ticker_classification_complete.csv")
 DEFAULT_TARGET_CURRENCY_PCT = {"EUR": 50.0, "USD": 50.0}
 DEFAULT_TARGET_INDUSTRY_PCT: dict[str, float] = {}
 DEFAULT_TARGET_STYLE_PCT = {"Growth": 34.0, "Value": 33.0, "Dividend": 33.0}

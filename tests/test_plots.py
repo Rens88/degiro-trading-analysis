@@ -3,11 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.config import BASE_RED
 from src.plots import (
     build_benchmark_comparison_figure,
     build_cash_allocation_figure,
     build_degiro_costs_quarterly_figure,
     build_drawdown_figure,
+    build_holdings_segment_pie_figure,
     build_holdings_over_time_figure,
     build_normalized_median_figure,
     build_performance_over_time_figure,
@@ -116,6 +118,45 @@ def test_holdings_over_time_hover_contains_cost_basis() -> None:
     )
     assert len(fig.data) >= 2
     assert "Net spent for current shares" in str(fig.data[0].hovertemplate)
+
+
+def test_holdings_segment_pie_highlights_over_target_slices() -> None:
+    holdings = pd.DataFrame(
+        [
+            {
+                "ticker": "ETF1",
+                "product": "ETF One",
+                "value_eur": 600.0,
+                "over_target_eur": 150.0,
+                "is_over_target_threshold": True,
+            },
+            {
+                "ticker": "ETF2",
+                "product": "ETF Two",
+                "value_eur": 400.0,
+                "over_target_eur": -20.0,
+                "is_over_target_threshold": False,
+            },
+        ]
+    )
+    fig = build_holdings_segment_pie_figure(
+        holdings_df=holdings,
+        title="ETF holdings (% of ETF sleeve)",
+        total_portfolio_value_eur=2_000.0,
+    )
+
+    assert len(fig.data) == 1
+    trace = fig.data[0]
+    colors = list(trace.marker.colors)
+    pull_values = list(trace.pull)
+    assert colors[0] == BASE_RED
+    assert colors[1] != BASE_RED
+    assert pull_values[0] > 0.0
+    assert pull_values[1] == 0.0
+    assert trace.textinfo == "label+text"
+    assert "Portfolio weight:" in str(trace.hovertext[0])
+    assert "ETF/non-ETF sleeve weight:" in str(trace.hovertext[0])
+    assert "Over target: EUR 150.00" in str(trace.hovertext[0])
 
 
 def test_degiro_quarterly_costs_figure_has_stacked_dataset_traces() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.ticker_characteristics import PLACEHOLDER_VALUE, resolve_ticker_characteristics
+from src.ticker_characteristics import resolve_ticker_characteristics
 
 
 def _classification_frame(rows: list[dict[str, str]]) -> pd.DataFrame:
@@ -10,12 +10,14 @@ def _classification_frame(rows: list[dict[str, str]]) -> pd.DataFrame:
         "instrument_id": "",
         "ticker": "",
         "product": "",
-        "auto_style": "",
-        "style": "",
-        "auto_industry": "",
-        "industry": "",
-        "classification_description": "",
-        "classification_source": "",
+        "currency": "",
+        "asset_class": "",
+        "primary_style": "",
+        "secondary_factor": "",
+        "gics_sector": "",
+        "gics_industry_group": "",
+        "gics_industry": "",
+        "gics_sub_industry": "",
     }
     normalized_rows: list[dict[str, str]] = []
     for row in rows:
@@ -26,20 +28,24 @@ def _classification_frame(rows: list[dict[str, str]]) -> pd.DataFrame:
 
 
 def test_resolver_prefers_instrument_id_before_ticker(tmp_path) -> None:
-    csv_path = tmp_path / "ticker_classifications.csv"
+    csv_path = tmp_path / "ticker_classification_complete.csv"
     _classification_frame(
         [
             {
                 "instrument_id": "ID_MATCH",
                 "ticker": "AAA",
-                "style": "Style from instrument id",
-                "industry": "Industry from instrument id",
+                "asset_class": "Equity",
+                "primary_style": "Growth",
+                "secondary_factor": "Momentum",
+                "gics_industry": "Industry by instrument",
             },
             {
                 "instrument_id": "OTHER_ID",
                 "ticker": "SHARED",
-                "style": "Style from ticker",
-                "industry": "Industry from ticker",
+                "asset_class": "ETF",
+                "primary_style": "Blend",
+                "secondary_factor": "Quality",
+                "gics_industry": "Industry by ticker",
             },
         ]
     ).to_csv(csv_path, index=False)
@@ -54,21 +60,25 @@ def test_resolver_prefers_instrument_id_before_ticker(tmp_path) -> None:
     )
 
     row = resolved.iloc[0]
-    assert str(row["style"]) == "Style from instrument id"
-    assert str(row["industry"]) == "Industry from instrument id"
+    assert str(row["primary_style"]) == "Growth"
+    assert str(row["gics_industry"]) == "Industry by instrument"
+    assert str(row["style"]) == "Growth"
+    assert str(row["industry"]) == "Industry by instrument"
     assert str(row["matched_by"]) == "instrument_id"
     assert int(stats["matched_instrument_id_count"]) == 1
 
 
 def test_resolver_falls_back_to_ticker_when_instrument_id_missing(tmp_path) -> None:
-    csv_path = tmp_path / "ticker_classifications.csv"
+    csv_path = tmp_path / "ticker_classification_complete.csv"
     _classification_frame(
         [
             {
                 "instrument_id": "SOME_OTHER_ID",
                 "ticker": "TKR_FALLBACK",
-                "style": "Ticker style",
-                "industry": "Ticker industry",
+                "asset_class": "Equity",
+                "primary_style": "Value",
+                "secondary_factor": "Defensive",
+                "gics_industry": "Ticker industry",
             }
         ]
     ).to_csv(csv_path, index=False)
@@ -83,14 +93,14 @@ def test_resolver_falls_back_to_ticker_when_instrument_id_missing(tmp_path) -> N
     )
 
     row = resolved.iloc[0]
-    assert str(row["style"]) == "Ticker style"
-    assert str(row["industry"]) == "Ticker industry"
+    assert str(row["primary_style"]) == "Value"
+    assert str(row["gics_industry"]) == "Ticker industry"
     assert str(row["matched_by"]) == "ticker"
     assert int(stats["matched_ticker_count"]) == 1
 
 
-def test_resolver_auto_appends_unknown_rows_with_placeholders(tmp_path) -> None:
-    csv_path = tmp_path / "ticker_classifications.csv"
+def test_resolver_unmatched_rows_use_inference_and_do_not_append(tmp_path) -> None:
+    csv_path = tmp_path / "ticker_classification_complete.csv"
     _classification_frame([]).to_csv(csv_path, index=False)
 
     instruments = pd.DataFrame(
@@ -102,44 +112,11 @@ def test_resolver_auto_appends_unknown_rows_with_placeholders(tmp_path) -> None:
         auto_append_missing=True,
     )
 
-    assert int(stats["appended_count"]) == 1
     row = resolved.iloc[0]
-    assert str(row["style"]) == PLACEHOLDER_VALUE
-    assert str(row["industry"]) == PLACEHOLDER_VALUE
-    assert str(row["auto_style"]) == "Blend"
-    assert str(row["auto_industry"]) == "Broad-market ETF"
-
+    assert str(row["asset_class"]) == "ETF"
+    assert str(row["primary_style"]) == "Blend"
+    assert str(row["gics_industry"]) == "Multi-Sector"
+    assert str(row["matched_by"]) == "none"
+    assert int(stats["appended_count"]) == 0
     saved = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    assert saved.shape[0] == 1
-    saved_row = saved.iloc[0]
-    assert str(saved_row["instrument_id"]) == "NEW_ID"
-    assert str(saved_row["ticker"]) == "NEWTKR"
-    assert str(saved_row["product"]) == "MSCI World ETF"
-    assert str(saved_row["style"]) == PLACEHOLDER_VALUE
-    assert str(saved_row["industry"]) == PLACEHOLDER_VALUE
-    assert str(saved_row["classification_description"]) == PLACEHOLDER_VALUE
-    assert str(saved_row["classification_source"]) == PLACEHOLDER_VALUE
-
-
-def test_resolver_auto_append_is_idempotent(tmp_path) -> None:
-    csv_path = tmp_path / "ticker_classifications.csv"
-    _classification_frame([]).to_csv(csv_path, index=False)
-    instruments = pd.DataFrame(
-        [{"instrument_id": "NEW_ID", "ticker": "NEWTKR", "product": "Any", "is_etf": False}]
-    )
-
-    _resolved_first, stats_first = resolve_ticker_characteristics(
-        instruments_df=instruments,
-        ticker_classifications_path=csv_path,
-        auto_append_missing=True,
-    )
-    _resolved_second, stats_second = resolve_ticker_characteristics(
-        instruments_df=instruments,
-        ticker_classifications_path=csv_path,
-        auto_append_missing=True,
-    )
-
-    assert int(stats_first["appended_count"]) == 1
-    assert int(stats_second["appended_count"]) == 0
-    saved = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    assert saved.shape[0] == 1
+    assert saved.shape[0] == 0

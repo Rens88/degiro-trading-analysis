@@ -1,0 +1,28 @@
+instrument_id,ticker,product,currency,asset_class,primary_style,secondary_factor,gics_sector,gics_industry_group,gics_industry,gics_sub_industry
+US02079K3059,GOOGL,ALPHABET INC CLASS A,USD,Equity,Growth,Momentum,Communication Services,Media & Entertainment,Interactive Media & Services,Interactive Media & Services
+US0231351067,AMZN,AMAZON.COM INC,USD,Equity,Growth,Cyclical,Consumer Discretionary,Retailing,Broadline Retail,Broadline Retail
+NL0010273215,ASML.AS,ASML HOLDING NV,EUR,Equity,Growth,Cyclical,Information Technology,Semiconductors & Semiconductor Equipment,Semiconductor Equipment,Semiconductor Equipment
+NL0011872643,ASRNL.AS,ASR NEDERLAND NV,EUR,Equity,Dividend,Defensive,Financials,Insurance,Insurance,Multi-line Insurance
+US17275R1023,CSCO,CISCO SYSTEMS INC,USD,Equity,Blend,Quality,Information Technology,Technology Hardware & Equipment,Communications Equipment,Communications Equipment
+DE0005552004,DHL.DE,DEUTSCHE POST AG,EUR,Equity,Blend,Cyclical,Industrials,Transportation,Air Freight & Logistics,Air Freight & Logistics
+BMG3602E1084,FLOW.AS,FLOW TRADERS LTD,EUR,Equity,Blend,Cyclical,Financials,Capital Markets,Capital Markets,Diversified Capital Markets
+US3703341046,GIS,GENERAL MILLS INC,USD,Equity,Dividend,Defensive,Consumer Staples,"Food, Beverage & Tobacco",Food Products,Packaged Foods & Meats
+US3755581036,GILD,GILEAD SCIENCES INC,USD,Equity,Value,Defensive,Health Care,"Pharmaceuticals, Biotechnology & Life Sciences",Biotechnology,Biotechnology
+US4592001014,IBM,INTERNATIONAL BUSINESS MACHINES ...,USD,Equity,Value,Quality,Information Technology,Software & Services,IT Services,IT Consulting & Other Services
+NL0014332678,JDEP.AS,JDE PEETS NV,EUR,Equity,Dividend,Defensive,Consumer Staples,"Food, Beverage & Tobacco",Beverages,Soft Drinks & Non-alcoholic Beverages
+NL0011794037,AD.AS,KONINKLIJKE AHOLD DELHAIZE NV,EUR,Equity,Dividend,Defensive,Consumer Staples,Consumer Staples Distribution & Retail,Consumer Staples Merchandise Retail,Consumer Staples Merchandise Retail
+US5951121038,MU,MICRON TECHNOLOGY INC,USD,Equity,Growth,Cyclical,Information Technology,Semiconductors & Semiconductor Equipment,Semiconductors,Semiconductors
+US67066G1040,NVDA,NVIDIA CORP,USD,Equity,Growth,Momentum,Information Technology,Semiconductors & Semiconductor Equipment,Semiconductors,Semiconductors
+US7134481081,PEP,PEPSICO INC,USD,Equity,Dividend,Defensive,Consumer Staples,"Food, Beverage & Tobacco",Beverages,Soft Drinks
+US7170811035,PFE,PFIZER INC,USD,Equity,Dividend,Defensive,Health Care,"Pharmaceuticals, Biotechnology & Life Sciences",Pharmaceuticals,Pharmaceuticals
+US7427181091,PG,PROCTER & GAMBLE CO,USD,Equity,Dividend,Defensive,Consumer Staples,Household & Personal Products,Household Products,Household Products
+NL0012015705,JTKWY,TAKEAWAY,EUR,Equity,Growth,Cyclical,Consumer Discretionary,Consumer Services,"Hotels, Restaurants & Leisure",Restaurants
+FR0000021842,BEL.BR,AMUNDI BEL 20 UCITS ETF DIST,EUR,ETF,Blend,Cyclical,Multi-Sector,Multi-Sector,Multi-Sector,Multi-Sector
+IE00BKY58G26,HSXD.L,HSBC ASIA PACIFIC EX JAPAN SCRND EQ UCITS ETF USD,EUR,ETF,Blend,Quality,Multi-Sector,Multi-Sector,Multi-Sector,Multi-Sector
+IE00B4L5Y983,IWDA.AS,ISHARES CORE MSCI WORLD UCITS ET...,EUR,ETF,Blend,Quality,Multi-Sector,Multi-Sector,Multi-Sector,Multi-Sector
+IE00B0M63284,IPRP.AS,ISHARES EUROPEAN PROPERTY YIELD ...,EUR,ETF,Dividend,Cyclical,Real Estate,Equity Real Estate Investment Trusts (REITs),Equity Real Estate Investment Trusts (REITs),Diversified REITs
+IE00B1XNHC34,IQQH.DE,ISHARES GLOBAL CLEAN ENERGY TRNSTN UCITS ETF USD D,EUR,ETF,Growth,Momentum,Utilities,Utilities,Independent Power and Renewable Electricity Producers,Independent Power and Renewable Electricity Producers
+DE000A0D6554,NDX1.DE,NORDEX SE,EUR,Equity,Growth,Cyclical,Industrials,Capital Goods,Electrical Equipment,Electrical Components & Equipment
+IE00B5M1WJ87,SPYW.DE,SPDR S&P EURO DIVIDEND ARISTOCRA...,EUR,ETF,Dividend,Quality,Multi-Sector,Multi-Sector,Multi-Sector,Multi-Sector
+NL0010408704,TSWE.AS,VANECK WORLD EQUAL WEIGHT SCREEN...,EUR,ETF,Blend,Quality,Multi-Sector,Multi-Sector,Multi-Sector,Multi-Sector
+IE00B3XXRP09,VUSA.L,VANGUARD S&P 500 UCITS ETF USD DIS,EUR,ETF,Blend,Quality,Multi-Sector,Multi-Sector,Multi-Sector,Multi-Sector

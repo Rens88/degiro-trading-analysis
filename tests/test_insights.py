@@ -160,7 +160,6 @@ def test_spread_analysis_outputs_style_and_next_steps() -> None:
             "target_currency_pct": {"EUR": 60.0, "USD": 40.0},
             "target_industry_pct": {"Broad-market ETF": 50.0, "Unclassified": 50.0},
             "target_style_pct": {"Blend": 50.0, "Dividend": 50.0},
-            "holding_category_overrides": {},
         },
         prices_eur=prices,
         auto_append_ticker_characteristics=False,
@@ -174,14 +173,17 @@ def test_spread_analysis_outputs_style_and_next_steps() -> None:
     assert float(holdings_row["actual"]) == 2.0
 
 
-def test_spread_analysis_uses_csv_characteristics_and_manual_overrides(tmp_path) -> None:
-    csv_path = tmp_path / "ticker_classifications.csv"
+def test_spread_analysis_uses_csv_characteristics_only(tmp_path) -> None:
+    csv_path = tmp_path / "ticker_classification_complete.csv"
     csv_path.write_text(
         "\n".join(
             [
-                "instrument_id,ticker,product,auto_style,style,auto_industry,industry,classification_description,classification_source",
-                "ID_MATCH,IDTKR,Instrument by id,Unclassified,CSV Style ID,Unclassified,CSV Industry ID,desc,source",
-                "ANOTHER_ID,TKR_FALLBACK,Instrument by ticker,Unclassified,CSV Style Ticker,Unclassified,CSV Industry Ticker,desc,source",
+                (
+                    "instrument_id,ticker,product,currency,asset_class,primary_style,secondary_factor,"
+                    "gics_sector,gics_industry_group,gics_industry,gics_sub_industry"
+                ),
+                "ID_MATCH,IDTKR,Instrument by id,EUR,Equity,Growth,Momentum,IT,Software,CSV Industry ID,CSV Sub ID",
+                "ANOTHER_ID,TKR_FALLBACK,Instrument by ticker,USD,Equity,Value,Defensive,Health,Pharma,CSV Industry Ticker,CSV Sub Ticker",
             ]
         ),
         encoding="utf-8",
@@ -218,7 +220,6 @@ def test_spread_analysis_uses_csv_characteristics_and_manual_overrides(tmp_path)
             "target_currency_pct": {},
             "target_industry_pct": {},
             "target_style_pct": {},
-            "holding_category_overrides": {"ID_MATCH": {"style": "Manual Style", "industry": "Manual Industry"}},
         },
         prices_eur=pd.DataFrame(),
         ticker_classifications_path=csv_path,
@@ -227,12 +228,112 @@ def test_spread_analysis_uses_csv_characteristics_and_manual_overrides(tmp_path)
 
     concentration = out["concentration_df"]
     row_id = concentration.loc[concentration["product"] == "First product"].iloc[0]
-    assert str(row_id["style"]) == "Manual Style"
-    assert str(row_id["industry"]) == "Manual Industry"
+    assert str(row_id["style"]) == "Growth"
+    assert str(row_id["industry"]) == "CSV Industry ID"
 
     row_ticker = concentration.loc[concentration["product"] == "Second product"].iloc[0]
-    assert str(row_ticker["style"]) == "CSV Style Ticker"
+    assert str(row_ticker["style"]) == "Value"
     assert str(row_ticker["industry"]) == "CSV Industry Ticker"
+
+
+def test_spread_analysis_handles_duplicate_instrument_ids_for_correlation() -> None:
+    holdings = pd.DataFrame(
+        {
+            "instrument_id": ["DUP1", "DUP1", "OTHER1"],
+            "product": ["Duplicate Name A", "Duplicate Name B", "Other Holding"],
+            "ticker": ["DUPA", "DUPB", "OTHR"],
+            "currency": ["EUR", "EUR", "USD"],
+            "is_etf": [False, False, True],
+            "quantity": [5.0, 3.0, 4.0],
+            "value_eur": [600.0, 400.0, 500.0],
+        }
+    )
+    idx = pd.date_range("2025-01-01", periods=220, freq="D")
+    dup_px = pd.Series(range(220), index=idx, dtype="float64") + 100.0
+    prices = pd.DataFrame(
+        {
+            "DUP1": dup_px,
+            "OTHER1": dup_px * 1.01 + 2.0,
+        }
+    )
+
+    out = build_ai_spread_analysis(
+        holdings_df=holdings,
+        total_value_eur=1700.0,
+        cash_value_eur=200.0,
+        cash_detail_df=pd.DataFrame({"currency": ["EUR"], "balance_eur": [200.0]}),
+        strategy={
+            "target_etf_fraction": 0.5,
+            "desired_etf_holdings": 2,
+            "desired_non_etf_holdings": 3,
+            "target_cash_pct": 5.0,
+            "max_single_holding_pct": 70.0,
+            "max_top5_holdings_pct": 95.0,
+            "max_single_currency_pct": 90.0,
+            "max_single_industry_pct": 90.0,
+            "max_pair_correlation": 0.85,
+            "min_total_holdings": 2,
+            "min_over_value_eur": 10.0,
+            "target_currency_pct": {},
+            "target_industry_pct": {},
+            "target_style_pct": {},
+        },
+        prices_eur=prices,
+        auto_append_ticker_characteristics=False,
+    )
+
+    assert isinstance(out.get("correlation_warnings_df"), pd.DataFrame)
+
+
+def test_spread_analysis_reports_instrument_metadata_conflicts() -> None:
+    holdings = pd.DataFrame(
+        {
+            "instrument_id": ["DUP1", "DUP1", "OTHER1"],
+            "product": ["Duplicate Name A", "Duplicate Name B", "Other Holding"],
+            "ticker": ["DUPA", "DUPB", "OTHR"],
+            "currency": ["EUR", "USD", "USD"],
+            "is_etf": [False, False, True],
+            "quantity": [5.0, 3.0, 4.0],
+            "value_eur": [600.0, 400.0, 500.0],
+        }
+    )
+    idx = pd.date_range("2025-01-01", periods=220, freq="D")
+    prices = pd.DataFrame(
+        {
+            "DUP1": pd.Series(range(220), index=idx, dtype="float64") + 100.0,
+            "OTHER1": pd.Series(range(220), index=idx, dtype="float64") + 150.0,
+        }
+    )
+
+    out = build_ai_spread_analysis(
+        holdings_df=holdings,
+        total_value_eur=1700.0,
+        cash_value_eur=200.0,
+        cash_detail_df=pd.DataFrame({"currency": ["EUR"], "balance_eur": [200.0]}),
+        strategy={
+            "target_etf_fraction": 0.5,
+            "desired_etf_holdings": 2,
+            "desired_non_etf_holdings": 3,
+            "target_cash_pct": 5.0,
+            "max_single_holding_pct": 70.0,
+            "max_top5_holdings_pct": 95.0,
+            "max_single_currency_pct": 90.0,
+            "max_single_industry_pct": 90.0,
+            "max_pair_correlation": 0.85,
+            "min_total_holdings": 2,
+            "min_over_value_eur": 10.0,
+            "target_currency_pct": {},
+            "target_industry_pct": {},
+            "target_style_pct": {},
+        },
+        prices_eur=prices,
+        auto_append_ticker_characteristics=False,
+    )
+
+    conflicts = out.get("instrument_metadata_conflicts_df", pd.DataFrame())
+    assert not conflicts.empty
+    assert "DUP1" in set(conflicts["instrument_id"].astype(str))
+    assert any("Data quality warning:" in str(line) for line in out.get("summary_lines", []))
 
 
 def test_irr_helpers_do_not_emit_runtime_warnings_for_extreme_brackets() -> None:

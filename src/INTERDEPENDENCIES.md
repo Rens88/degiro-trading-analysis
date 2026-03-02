@@ -100,7 +100,6 @@ High-impact fields:
 - `max_pair_correlation`
 - `min_total_holdings`
 - `target_currency_pct`, `target_industry_pct`, `target_style_pct`
-- `holding_category_overrides`
 
 ## Edit Checklist for Risky Changes
 
