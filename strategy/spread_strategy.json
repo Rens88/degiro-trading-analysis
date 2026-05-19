@@ -15,12 +15,13 @@
     "max_top5_holdings_pct": 55.0,
     "min_over_value_eur": 400.0,
     "min_total_holdings": 12,
-    "target_cash_pct": 0.5,
+    "target_cash_pct": 10.0,
     "target_currency_pct": {
       "EUR": 50.0,
       "USD": 50.0
     },
-    "target_etf_fraction": 0.5,
+    "target_etf_pct": 45.0,
+    "target_non_etf_pct": 45.0,
     "target_industry_pct": {},
     "target_style_pct": {
       "Dividend": 33.0,

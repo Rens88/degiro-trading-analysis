@@ -92,10 +92,9 @@ Must stay aligned in:
 - `strategy/spread_strategy.json` saved values
 
 High-impact fields:
-- `target_etf_fraction`
+- `target_etf_pct`, `target_non_etf_pct`, `target_cash_pct`
 - `desired_etf_holdings`, `desired_non_etf_holdings`
 - `min_over_value_eur`
-- `target_cash_pct`
 - `max_single_holding_pct`, `max_top5_holdings_pct`, `max_single_currency_pct`, `max_single_industry_pct`
 - `max_pair_correlation`
 - `min_total_holdings`

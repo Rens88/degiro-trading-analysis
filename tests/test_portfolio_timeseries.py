@@ -258,6 +258,66 @@ def test_cash_before_first_account_row_starts_at_zero(monkeypatch) -> None:
     assert float(out.metrics.iloc[2]["cash"]) == 500.0
 
 
+def test_end_date_override_trims_to_latest_real_price_date(monkeypatch) -> None:
+    index = pd.date_range("2026-01-01", periods=3, freq="D")
+
+    def fake_fetch_price_series(*, ticker, start, end, cache_dir, logger):
+        return pd.Series([10.0, 11.0, 12.0], index=index, name=ticker)
+
+    monkeypatch.setattr(
+        "src.portfolio_timeseries.fetch_price_series",
+        fake_fetch_price_series,
+    )
+
+    transactions = pd.DataFrame(
+        [
+            {
+                "datetime": pd.Timestamp("2026-01-01 10:00:00"),
+                "instrument_id": "US0000000001",
+                "quantity": 1.0,
+                "is_cash_like": False,
+            }
+        ]
+    )
+    account = pd.DataFrame(
+        [
+            {
+                "datetime": pd.Timestamp("2026-01-01 09:00:00"),
+                "currency": "EUR",
+                "raw_balance": 100.0,
+                "balance_eur": 100.0,
+                "raw_change": 100.0,
+                "change_eur": 100.0,
+                "type": "external_deposit",
+            }
+        ]
+    )
+    instruments = pd.DataFrame(
+        [
+            {
+                "instrument_id": "US0000000001",
+                "product": "TEST",
+                "ticker": "TEST",
+                "currency": "EUR",
+                "is_cash_like": False,
+            }
+        ]
+    )
+
+    out = compute_portfolio_timeseries(
+        transactions=transactions,
+        account=account,
+        instruments=instruments,
+        end_date_override=pd.Timestamp("2026-01-10"),
+        cache_dir="cache",
+        logger=None,
+    )
+
+    assert out.metrics.index.max() == pd.Timestamp("2026-01-03")
+    assert out.prices_eur.index.max() == pd.Timestamp("2026-01-03")
+    assert out.latest_price_data_date == pd.Timestamp("2026-01-03")
+
+
 def test_cash_cumsum_excludes_internal_sweep_rows() -> None:
     daily_index = pd.date_range("2026-01-01", periods=2, freq="D")
     account = pd.DataFrame(

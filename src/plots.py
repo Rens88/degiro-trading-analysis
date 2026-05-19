@@ -166,7 +166,7 @@ def build_holdings_over_time_figure(
 
     fig.update_layout(
         template="plotly_white",
-        hovermode="x unified",
+        # hovermode="x unified",
         title="Holdings and Cash Over Time",
         height=900,
         yaxis=dict(title="EUR"),
@@ -684,6 +684,7 @@ def build_holdings_segment_pie_figure(
     holdings_df: pd.DataFrame,
     title: str,
     total_portfolio_value_eur: float | None = None,
+    target_total_pct: float | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if holdings_df is None or holdings_df.empty or "value_eur" not in holdings_df.columns:
@@ -797,4 +798,16 @@ def build_holdings_segment_pie_figure(
         margin=dict(l=10, r=10, t=50, b=20),
         legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
     )
+    target_value = pd.to_numeric(target_total_pct, errors="coerce")
+    if np.isfinite(target_value):
+        fig.add_annotation(
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            text=f"Target: {float(target_value):.1f}%",
+            showarrow=False,
+            font=dict(size=14, color="#4b5563"),
+            align="center",
+        )
     return fig

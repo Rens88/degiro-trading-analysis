@@ -43,9 +43,12 @@ from .config import (
     DEFAULT_TARGET_CURRENCY_PCT,
     DEFAULT_TARGET_CASH_PCT,
     DEFAULT_TARGET_ETF_FRACTION,
+    DEFAULT_TARGET_ETF_PCT,
     DEFAULT_TARGET_INDUSTRY_PCT,
+    DEFAULT_TARGET_NON_ETF_PCT,
     DEFAULT_TARGET_STYLE_PCT,
     REQUIRED_DATASET_FILES,
+    resolve_portfolio_target_split,
 )
 from .data_import import LoadedDataset, load_dataset
 from .exceptions import UserFacingError
@@ -56,6 +59,7 @@ from .portfolio_timeseries import (
     latest_fx_rate,
 )
 from .reconciliation import TotalsResult, combine_totals, reconcile_dataset
+from .tables import apply_ranked_target_per_holding_pct
 
 
 # Exit code used by the startup BAT script to decide whether to launch Streamlit.
@@ -159,15 +163,17 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
 
     raw_strategy = loaded.get("strategy", {}) if isinstance(loaded.get("strategy", {}), dict) else {}
     strategy = _strategy_with_defaults(raw_strategy)
+    raw_target_etf_pct = raw_strategy.get("target_etf_pct", raw_strategy.get("target_etf_fraction", "<missing>"))
+    raw_target_non_etf_pct = raw_strategy.get("target_non_etf_pct", "<missing>")
     raw_target_cash_pct = raw_strategy.get("target_cash_pct", "<missing>")
     print(f"[INFO] Strategy file resolved to: {strategy_path}")
     if not strategy_file_found:
         print("[WARN] Strategy file not found; using default strategy values.")
     print(
-        "[INFO] Strategy target_cash_pct: "
-        f"raw={raw_target_cash_pct!r}, "
-        f"resolved={strategy['target_cash_pct']!r}, "
-        f"default={DEFAULT_TARGET_CASH_PCT!r}"
+        "[INFO] Strategy target split (%): "
+        f"raw ETF={raw_target_etf_pct!r}, raw non-ETF={raw_target_non_etf_pct!r}, raw cash={raw_target_cash_pct!r}, "
+        f"resolved ETF={strategy['target_etf_pct']!r}, resolved non-ETF={strategy['target_non_etf_pct']!r}, "
+        f"resolved cash={strategy['target_cash_pct']!r}"
     )
     data_sources = loaded.get("data_sources", {}) if isinstance(loaded.get("data_sources", {}), dict) else {}
 
@@ -367,9 +373,12 @@ def evaluate_strategy(
     latest_price = _build_latest_price_map(prices_eur)
     latest_price_date = _build_latest_price_date_map(prices_eur)
     cost_basis = _compute_open_cost_basis_by_instrument(merged_transactions)
+    latest_metrics = metrics_df.iloc[-1] if isinstance(metrics_df, pd.DataFrame) and not metrics_df.empty else pd.Series(dtype="float64")
+    rebuilt_total_value = _to_float(latest_metrics.get("portfolio_value", np.nan), float(combined_totals.total_value_eur))
+    rebuilt_cash_value = _to_float(latest_metrics.get("cash", np.nan), float(combined_totals.cash_value_eur))
     holdings_df = _build_holdings_snapshot(
         portfolio_df=merged_portfolio,
-        combined_total_value=float(combined_totals.total_value_eur),
+        combined_total_value=rebuilt_total_value,
         latest_price_map=latest_price,
         latest_price_date_map=latest_price_date,
         cost_basis_map=cost_basis,
@@ -396,11 +405,12 @@ def evaluate_strategy(
     etf_df = etf_df[[c for c in holdings_cols if c in etf_df.columns]]
 
     cash_action_df = _build_cash_split_action(
-        combined_total_value=float(combined_totals.total_value_eur),
-        cash_value=float(combined_totals.cash_value_eur),
+        combined_total_value=rebuilt_total_value,
+        cash_value=rebuilt_cash_value,
         etf_value=float(etf_df["value_eur"].sum()),
         non_etf_value=float(non_etf_df["value_eur"].sum()),
-        target_etf_fraction=float(strategy["target_etf_fraction"]),
+        target_etf_pct=float(strategy["target_etf_pct"]),
+        target_non_etf_pct=float(strategy["target_non_etf_pct"]),
         target_cash_pct=float(strategy["target_cash_pct"]),
     )
     cash_action_df = cash_action_df[
@@ -412,6 +422,9 @@ def evaluate_strategy(
                 "deployable_cash_eur",
                 "to_etf_eur",
                 "to_non_etf_eur",
+                "cash_shortfall_eur",
+                "from_etf_to_cash_eur",
+                "from_non_etf_to_cash_eur",
                 "etf_w_pct",
                 "non_etf_w_pct",
             ]
@@ -420,15 +433,17 @@ def evaluate_strategy(
     ]
     trim_actions_df = _build_trim_actions_table(
         holdings_df=holdings_df,
-        combined_total_value=float(combined_totals.total_value_eur),
-        target_etf_fraction=float(strategy["target_etf_fraction"]),
+        combined_total_value=rebuilt_total_value,
+        target_etf_pct=float(strategy["target_etf_pct"]),
+        target_non_etf_pct=float(strategy["target_non_etf_pct"]),
         desired_etf_holdings=int(strategy["desired_etf_holdings"]),
         desired_non_etf_holdings=int(strategy["desired_non_etf_holdings"]),
         min_over_value_eur=float(strategy["min_over_value_eur"]),
     )
 
     deployable_cash = float(cash_action_df["deployable_cash_eur"].iloc[0]) if not cash_action_df.empty else 0.0
-    action_required = (deployable_cash > 1e-6) or (not trim_actions_df.empty)
+    cash_shortfall = float(cash_action_df["cash_shortfall_eur"].iloc[0]) if not cash_action_df.empty else 0.0
+    action_required = (deployable_cash > 1e-6) or (cash_shortfall > 1e-6) or (not trim_actions_df.empty)
     return {
         "growth_df": growth_df,
         "non_etf_df": non_etf_df,
@@ -459,7 +474,7 @@ def _print_strategy_report(report: dict[str, Any]) -> None:
     print(_format_table(etf_df))
 
     print("")
-    print("Suggested cash deployment to target ETF/non-ETF ratio")
+    print("Suggested cash deployment or replenishment for ETF/non-ETF/cash targets")
     print(_format_table(cash_action_df))
 
     print("")
@@ -706,7 +721,7 @@ def _build_holdings_snapshot(
     df["ticker"] = df["ticker"].fillna("").astype(str).str.strip()
     df["product"] = df["product"].fillna("").astype(str).str.strip()
     df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce")
-    df["value_eur"] = pd.to_numeric(df.get("value_eur"), errors="coerce").fillna(0.0)
+    df["value_eur"] = pd.to_numeric(df.get("value_eur"), errors="coerce").fillna(0.0).abs()
     df["is_etf"] = df["is_etf"].fillna(False).astype(bool)
 
     grouped = (
@@ -721,10 +736,12 @@ def _build_holdings_snapshot(
         )
 
     grouped["last_px_eur"] = grouped["instrument_id"].map(lambda iid: latest_price_map.get(str(iid), np.nan))
-    fallback_px = np.where(grouped["qty"].abs() > 1e-12, grouped["value_eur"] / grouped["qty"].abs(), np.nan)
+    fallback_px = np.where(grouped["qty"].abs() > 1e-12, grouped["value_eur"].abs() / grouped["qty"].abs(), np.nan)
     grouped["last_px_eur"] = grouped["last_px_eur"].where(grouped["last_px_eur"].notna(), fallback_px)
     grouped["px_date"] = grouped["instrument_id"].map(lambda iid: latest_price_date_map.get(str(iid), ""))
     grouped["cost_basis_eur"] = grouped["instrument_id"].map(lambda iid: float(cost_basis_map.get(str(iid), np.nan)))
+    recomputed_value = grouped["qty"].abs() * pd.to_numeric(grouped["last_px_eur"], errors="coerce")
+    grouped["value_eur"] = np.where(recomputed_value.notna(), recomputed_value, grouped["value_eur"].abs())
     grouped["pnl_eur"] = grouped["value_eur"] - grouped["cost_basis_eur"]
     grouped["value_pct"] = np.where(
         np.isfinite(combined_total_value) and combined_total_value > 0.0,
@@ -742,7 +759,8 @@ def _build_cash_split_action(
     cash_value: float,
     etf_value: float,
     non_etf_value: float,
-    target_etf_fraction: float,
+    target_etf_pct: float,
+    target_non_etf_pct: float,
     target_cash_pct: float,
 ) -> pd.DataFrame:
     if not np.isfinite(combined_total_value) or combined_total_value <= 0.0:
@@ -759,8 +777,9 @@ def _build_cash_split_action(
         )
     target_cash_value = target_cash_pct / 100.0 * combined_total_value
     deployable = max(cash_value - target_cash_value, 0.0)
-    target_etf_value = target_etf_fraction * combined_total_value
-    target_non_etf_value = (1.0 - target_etf_fraction) * combined_total_value
+    cash_shortfall = max(target_cash_value - cash_value, 0.0)
+    target_etf_value = target_etf_pct / 100.0 * combined_total_value
+    target_non_etf_value = target_non_etf_pct / 100.0 * combined_total_value
     gap_etf = max(target_etf_value - etf_value, 0.0)
     gap_non = max(target_non_etf_value - non_etf_value, 0.0)
     if deployable > 0.0:
@@ -769,11 +788,35 @@ def _build_cash_split_action(
             to_etf = deployable * gap_etf / gap_total
             to_non = deployable * gap_non / gap_total
         else:
-            to_etf = deployable * target_etf_fraction
-            to_non = deployable * (1.0 - target_etf_fraction)
+            invested_target_total = max(target_etf_pct + target_non_etf_pct, 0.0)
+            if invested_target_total > 0.0:
+                to_etf = deployable * target_etf_pct / invested_target_total
+                to_non = deployable * target_non_etf_pct / invested_target_total
+            else:
+                to_etf = 0.0
+                to_non = 0.0
     else:
         to_etf = 0.0
         to_non = 0.0
+
+    excess_etf = max(etf_value - target_etf_value, 0.0)
+    excess_non = max(non_etf_value - target_non_etf_value, 0.0)
+    excess_total = excess_etf + excess_non
+    if cash_shortfall > 0.0:
+        if excess_total > 0.0:
+            from_etf = cash_shortfall * excess_etf / excess_total
+            from_non = cash_shortfall * excess_non / excess_total
+        else:
+            invested_current_total = max(etf_value + non_etf_value, 0.0)
+            if invested_current_total > 0.0:
+                from_etf = cash_shortfall * etf_value / invested_current_total
+                from_non = cash_shortfall * non_etf_value / invested_current_total
+            else:
+                from_etf = 0.0
+                from_non = 0.0
+    else:
+        from_etf = 0.0
+        from_non = 0.0
 
     return pd.DataFrame(
         [
@@ -783,6 +826,9 @@ def _build_cash_split_action(
                 "deployable_cash_eur": float(deployable),
                 "to_etf_eur": float(to_etf),
                 "to_non_etf_eur": float(to_non),
+                "cash_shortfall_eur": float(cash_shortfall),
+                "from_etf_to_cash_eur": float(from_etf),
+                "from_non_etf_to_cash_eur": float(from_non),
                 "etf_w_pct": float(etf_value / combined_total_value * 100.0),
                 "non_etf_w_pct": float(non_etf_value / combined_total_value * 100.0),
             }
@@ -794,7 +840,8 @@ def _build_trim_actions_table(
     *,
     holdings_df: pd.DataFrame,
     combined_total_value: float,
-    target_etf_fraction: float,
+    target_etf_pct: float,
+    target_non_etf_pct: float,
     desired_etf_holdings: int,
     desired_non_etf_holdings: int,
     min_over_value_eur: float,
@@ -807,14 +854,14 @@ def _build_trim_actions_table(
         return pd.DataFrame(
             columns=["ticker", "product", "segment", "qty", "w_pct", "target_pct", "over_eur", "sell_qty"]
         )
-    n_etf = max(int(desired_etf_holdings), 1)
-    n_non = max(int(desired_non_etf_holdings), 1)
-    out = holdings_df.copy()
-    out["target_pct"] = np.where(
-        out["is_etf"],
-        target_etf_fraction / n_etf * 100.0,
-        (1.0 - target_etf_fraction) / n_non * 100.0,
+    out = apply_ranked_target_per_holding_pct(
+        holdings_df,
+        target_etf_pct=target_etf_pct,
+        target_non_etf_pct=target_non_etf_pct,
+        desired_etf_holdings=desired_etf_holdings,
+        desired_non_etf_holdings=desired_non_etf_holdings,
     )
+    out = out.rename(columns={"target_per_holding_pct": "target_pct"})
     out["target_value_eur"] = out["target_pct"] / 100.0 * combined_total_value
     out["over_eur"] = out["value_eur"] - out["target_value_eur"]
     out = out.loc[pd.to_numeric(out["over_eur"], errors="coerce") > float(min_over_value_eur)].copy()
@@ -869,13 +916,12 @@ def _strategy_with_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     # defaults so saved strategy JSON can be used by both UI and startup CLI.
     data = raw if isinstance(raw, dict) else {}
     return {
-        "target_etf_fraction": _to_float(data.get("target_etf_fraction"), DEFAULT_TARGET_ETF_FRACTION),
+        **resolve_portfolio_target_split(data),
         "desired_etf_holdings": _to_int(data.get("desired_etf_holdings"), DEFAULT_DESIRED_ETF_HOLDINGS),
         "desired_non_etf_holdings": _to_int(
             data.get("desired_non_etf_holdings"),
             DEFAULT_DESIRED_NON_ETF_HOLDINGS,
         ),
-        "target_cash_pct": _to_float(data.get("target_cash_pct"), DEFAULT_TARGET_CASH_PCT),
         "max_single_holding_pct": _to_float(
             data.get("max_single_holding_pct"),
             DEFAULT_MAX_SINGLE_HOLDING_PCT,

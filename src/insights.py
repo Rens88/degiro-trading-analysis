@@ -25,6 +25,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .config import resolve_portfolio_target_split
+from .tables import apply_ranked_target_per_holding_pct
 from .ticker_characteristics import resolve_ticker_characteristics
 
 
@@ -147,10 +149,12 @@ def build_ai_spread_analysis(
     if total_value <= 0.0:
         return {}
 
-    target_etf_fraction = _to_float(strategy.get("target_etf_fraction"), 0.5)
+    target_split = resolve_portfolio_target_split(strategy)
+    target_etf_pct = float(target_split["target_etf_pct"])
+    target_non_etf_pct = float(target_split["target_non_etf_pct"])
+    target_cash_pct = float(target_split["target_cash_pct"])
     desired_etf_holdings = max(_to_int(strategy.get("desired_etf_holdings"), 4), 1)
     desired_non_etf_holdings = max(_to_int(strategy.get("desired_non_etf_holdings"), 12), 1)
-    target_cash_pct = _to_float(strategy.get("target_cash_pct"), 10.0)
     max_single_holding_pct = _to_float(strategy.get("max_single_holding_pct"), 12.0)
     max_top5_holdings_pct = _to_float(strategy.get("max_top5_holdings_pct"), 55.0)
     max_single_currency_pct = _to_float(strategy.get("max_single_currency_pct"), 65.0)
@@ -321,8 +325,8 @@ def build_ai_spread_analysis(
                 "segment": "ETF",
                 "value_eur": etf_value,
                 "share_pct_total": etf_pct,
-                "target_share_pct_total": target_etf_fraction * 100.0,
-                "delta_vs_target_pct": etf_pct - target_etf_fraction * 100.0,
+                "target_share_pct_total": target_etf_pct,
+                "delta_vs_target_pct": etf_pct - target_etf_pct,
                 "holdings_count": etf_count,
                 "target_holdings_count": desired_etf_holdings,
             },
@@ -330,8 +334,8 @@ def build_ai_spread_analysis(
                 "segment": "Non-ETF",
                 "value_eur": non_etf_value,
                 "share_pct_total": non_etf_pct,
-                "target_share_pct_total": (1.0 - target_etf_fraction) * 100.0,
-                "delta_vs_target_pct": non_etf_pct - (1.0 - target_etf_fraction) * 100.0,
+                "target_share_pct_total": target_non_etf_pct,
+                "delta_vs_target_pct": non_etf_pct - target_non_etf_pct,
                 "holdings_count": non_etf_count,
                 "target_holdings_count": desired_non_etf_holdings,
             },
@@ -351,9 +355,16 @@ def build_ai_spread_analysis(
         {
             "metric": "ETF share (%)",
             "actual": etf_pct,
-            "target_or_limit": f"target {target_etf_fraction * 100.0:,.1f}%",
-            "delta": etf_pct - target_etf_fraction * 100.0,
-            "status": _status_target(etf_pct, target_etf_fraction * 100.0, tolerance=3.0),
+            "target_or_limit": f"target {target_etf_pct:,.1f}%",
+            "delta": etf_pct - target_etf_pct,
+            "status": _status_target(etf_pct, target_etf_pct, tolerance=3.0),
+        },
+        {
+            "metric": "Non-ETF share (%)",
+            "actual": non_etf_pct,
+            "target_or_limit": f"target {target_non_etf_pct:,.1f}%",
+            "delta": non_etf_pct - target_non_etf_pct,
+            "status": _status_target(non_etf_pct, target_non_etf_pct, tolerance=3.0),
         },
         {
             "metric": "Cash share (%)",
@@ -418,12 +429,12 @@ def build_ai_spread_analysis(
     action_rows: list[dict[str, Any]] = []
     what_to_do_rows: list[dict[str, Any]] = []
 
-    n_etf = max(int(desired_etf_holdings), 1)
-    n_non_etf = max(int(desired_non_etf_holdings), 1)
-    holdings["target_per_holding_pct"] = np.where(
-        holdings["is_etf"],
-        target_etf_fraction / n_etf * 100.0,
-        (1.0 - target_etf_fraction) / n_non_etf * 100.0,
+    holdings = apply_ranked_target_per_holding_pct(
+        holdings,
+        target_etf_pct=target_etf_pct,
+        target_non_etf_pct=target_non_etf_pct,
+        desired_etf_holdings=desired_etf_holdings,
+        desired_non_etf_holdings=desired_non_etf_holdings,
     )
     holdings["target_value_eur"] = holdings["target_per_holding_pct"] / 100.0 * total_value
     holdings["over_target_eur"] = holdings["value_eur"] - holdings["target_value_eur"]
@@ -464,8 +475,14 @@ def build_ai_spread_analysis(
             }
         )
 
-    etf_low = holdings.loc[holdings["is_etf"]].sort_values("value_pct_total", ascending=True).head(2)
-    non_etf_low = holdings.loc[~holdings["is_etf"]].sort_values("value_pct_total", ascending=True).head(5)
+    etf_low = holdings.loc[holdings["is_etf"] & (holdings["target_per_holding_pct"] > 0.0)].sort_values(
+        "value_pct_total",
+        ascending=True,
+    ).head(2)
+    non_etf_low = holdings.loc[(~holdings["is_etf"]) & (holdings["target_per_holding_pct"] > 0.0)].sort_values(
+        "value_pct_total",
+        ascending=True,
+    ).head(5)
     for row in etf_low.itertuples(index=False):
         what_to_do_rows.append(
             {
@@ -501,16 +518,23 @@ def build_ai_spread_analysis(
 
     target_cash_value = target_cash_pct / 100.0 * total_value
     deployable_cash = max(cash_value - target_cash_value, 0.0)
-    etf_gap_eur = max(target_etf_fraction * total_value - etf_value, 0.0)
-    non_etf_gap_eur = max((1.0 - target_etf_fraction) * total_value - non_etf_value, 0.0)
+    target_etf_value = target_etf_pct / 100.0 * total_value
+    target_non_etf_value = target_non_etf_pct / 100.0 * total_value
+    etf_gap_eur = max(target_etf_value - etf_value, 0.0)
+    non_etf_gap_eur = max(target_non_etf_value - non_etf_value, 0.0)
     gap_total = etf_gap_eur + non_etf_gap_eur
     if deployable_cash > 0.0:
         if gap_total > 0.0:
             cash_to_etf = deployable_cash * etf_gap_eur / gap_total
             cash_to_non_etf = deployable_cash * non_etf_gap_eur / gap_total
         else:
-            cash_to_etf = deployable_cash * target_etf_fraction
-            cash_to_non_etf = deployable_cash * (1.0 - target_etf_fraction)
+            invested_target_total = max(target_etf_pct + target_non_etf_pct, 0.0)
+            if invested_target_total > 0.0:
+                cash_to_etf = deployable_cash * target_etf_pct / invested_target_total
+                cash_to_non_etf = deployable_cash * target_non_etf_pct / invested_target_total
+            else:
+                cash_to_etf = 0.0
+                cash_to_non_etf = 0.0
         what_to_do_rows.append(
             {
                 "priority": "Medium",
@@ -536,6 +560,41 @@ def build_ai_spread_analysis(
                 "what_we_see": f"Cash above target by approximately EUR {deployable_cash:,.2f}.",
                 "future_action": (
                     f"Deploy roughly EUR {cash_to_etf:,.2f} to ETF and EUR {cash_to_non_etf:,.2f} to non-ETF."
+                ),
+            }
+        )
+
+    cash_shortfall = max(target_cash_value - cash_value, 0.0)
+    etf_excess_eur = max(etf_value - target_etf_value, 0.0)
+    non_etf_excess_eur = max(non_etf_value - target_non_etf_value, 0.0)
+    excess_total = etf_excess_eur + non_etf_excess_eur
+    if cash_shortfall > 0.0:
+        if excess_total > 0.0:
+            etf_to_cash = cash_shortfall * etf_excess_eur / excess_total
+            non_etf_to_cash = cash_shortfall * non_etf_excess_eur / excess_total
+        else:
+            invested_current_total = max(etf_value + non_etf_value, 0.0)
+            if invested_current_total > 0.0:
+                etf_to_cash = cash_shortfall * etf_value / invested_current_total
+                non_etf_to_cash = cash_shortfall * non_etf_value / invested_current_total
+            else:
+                etf_to_cash = 0.0
+                non_etf_to_cash = 0.0
+        what_to_do_rows.append(
+            {
+                "priority": "Medium",
+                "requires_action": True,
+                "action_type": "Raise cash buffer",
+                "instrument_id": "",
+                "product": "",
+                "ticker": "",
+                "segment": "Portfolio",
+                "current_pct": cash_pct,
+                "target_pct": target_cash_pct,
+                "suggested_amount_eur": cash_shortfall,
+                "note": (
+                    f"Move about EUR {etf_to_cash:,.2f} from ETF and EUR {non_etf_to_cash:,.2f} "
+                    "from non-ETF into cash."
                 ),
             }
         )
@@ -641,25 +700,25 @@ def build_ai_spread_analysis(
             }
         )
 
-    if etf_pct > target_etf_fraction * 100.0 + 3.0:
-        shift = (etf_pct - target_etf_fraction * 100.0) / 100.0 * total_value
+    if etf_pct > target_etf_pct + 3.0:
+        shift = (etf_pct - target_etf_pct) / 100.0 * total_value
         action_rows.append(
             {
                 "priority": "Medium",
                 "requires_action": True,
                 "theme": "ETF / non-ETF spread",
-                "what_we_see": f"ETF share is {etf_pct:,.1f}% vs target {target_etf_fraction * 100.0:,.1f}%.",
+                "what_we_see": f"ETF share is {etf_pct:,.1f}% vs target {target_etf_pct:,.1f}%.",
                 "future_action": f"Favor non-ETF adds by about EUR {shift:,.2f} over next contributions.",
             }
         )
-    elif etf_pct < target_etf_fraction * 100.0 - 3.0:
-        shift = (target_etf_fraction * 100.0 - etf_pct) / 100.0 * total_value
+    elif etf_pct < target_etf_pct - 3.0:
+        shift = (target_etf_pct - etf_pct) / 100.0 * total_value
         action_rows.append(
             {
                 "priority": "Medium",
                 "requires_action": True,
                 "theme": "ETF / non-ETF spread",
-                "what_we_see": f"ETF share is {etf_pct:,.1f}% vs target {target_etf_fraction * 100.0:,.1f}%.",
+                "what_we_see": f"ETF share is {etf_pct:,.1f}% vs target {target_etf_pct:,.1f}%.",
                 "future_action": f"Favor ETF adds by about EUR {shift:,.2f} over next contributions.",
             }
         )
@@ -733,10 +792,9 @@ def build_ai_spread_analysis(
 
     summary_lines = [
         (
-            f"ETF/non-ETF split: {etf_pct:,.1f}% / {non_etf_pct:,.1f}% "
-            f"(target {target_etf_fraction * 100.0:,.1f}% / {(1.0 - target_etf_fraction) * 100.0:,.1f}%)."
+            f"ETF/non-ETF/cash split: {etf_pct:,.1f}% / {non_etf_pct:,.1f}% / {cash_pct:,.1f}% "
+            f"(target {target_etf_pct:,.1f}% / {target_non_etf_pct:,.1f}% / {target_cash_pct:,.1f}%)."
         ),
-        f"Cash allocation: {cash_pct:,.1f}% (target {target_cash_pct:,.1f}%).",
         f"Concentration: largest holding {largest_holding_pct:,.1f}%, top-5 {top5_pct:,.1f}%.",
         (
             f"Broadest exposures: currency {largest_currency_name} {largest_currency_pct:,.1f}%, "

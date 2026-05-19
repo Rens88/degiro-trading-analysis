@@ -47,6 +47,7 @@ class TimeSeriesResult:
     metrics: pd.DataFrame
     positions: pd.DataFrame
     prices_eur: pd.DataFrame
+    latest_price_data_date: pd.Timestamp | None
     fill_stats: pd.DataFrame
     warnings: list[str]
     issues: list[dict[str, object]]
@@ -189,7 +190,7 @@ def compute_portfolio_timeseries(
         instruments=instruments,
         daily_index=daily_index,
     )
-    prices_eur, fill_stats, price_warnings, price_issues = build_daily_prices_eur(
+    prices_eur, fill_stats, price_warnings, price_issues, latest_price_data_date = build_daily_prices_eur(
         instruments=instruments,
         daily_index=daily_index,
         cache_dir=cache_dir,
@@ -260,6 +261,13 @@ def compute_portfolio_timeseries(
         axis=1,
     )
 
+    normalized_latest_price_date = pd.to_datetime(latest_price_data_date, errors="coerce")
+    if end_date_override is not None and pd.notna(normalized_latest_price_date):
+        trim_end_date = pd.Timestamp(normalized_latest_price_date).normalize()
+        positions = positions.loc[:trim_end_date].copy()
+        prices_eur = prices_eur.loc[:trim_end_date].copy()
+        metrics = metrics.loc[:trim_end_date].copy()
+
     cash_gap = (cash_from_statement - cash_from_changes).abs()
     if not cash_gap.empty and float(cash_gap.max()) > 5.0:
         sample = pd.DataFrame(
@@ -310,6 +318,11 @@ def compute_portfolio_timeseries(
         metrics=metrics,
         positions=positions,
         prices_eur=prices_eur,
+        latest_price_data_date=(
+            pd.Timestamp(normalized_latest_price_date).normalize()
+            if pd.notna(normalized_latest_price_date)
+            else None
+        ),
         fill_stats=fill_stats,
         warnings=warnings,
         issues=issues,
@@ -350,15 +363,16 @@ def build_daily_prices_eur(
     daily_index: pd.DatetimeIndex,
     cache_dir: str,
     logger: logging.Logger | None,
- ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[dict[str, object]]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[dict[str, object]], pd.Timestamp | None]:
     warnings: list[str] = []
     issues: list[dict[str, object]] = []
     prices: dict[str, pd.Series] = {}
     fill_rows: list[dict[str, object]] = []
+    latest_price_data_date: pd.Timestamp | None = None
 
     non_cash = instruments[~instruments["is_cash_like"].fillna(False)].copy()
     if non_cash.empty:
-        return pd.DataFrame(index=daily_index), pd.DataFrame(), warnings, issues
+        return pd.DataFrame(index=daily_index), pd.DataFrame(), warnings, issues, None
 
     start, end = daily_index.min(), daily_index.max()
     for row in non_cash.itertuples(index=False):
@@ -389,6 +403,17 @@ def build_daily_prices_eur(
         except UserFacingError as exc:
             warnings.append(str(exc))
             continue
+
+        local_valid = local.dropna()
+        if not local_valid.empty:
+            local_last_date = pd.to_datetime(local_valid.index.max(), errors="coerce")
+            if pd.notna(local_last_date):
+                local_last_date = pd.Timestamp(local_last_date).normalize()
+                latest_price_data_date = (
+                    local_last_date
+                    if latest_price_data_date is None
+                    else max(latest_price_data_date, local_last_date)
+                )
 
         local = local.reindex(daily_index)
         original_missing = int(local.isna().sum())
@@ -447,7 +472,13 @@ def build_daily_prices_eur(
                 remaining_na,
             )
 
-    return pd.DataFrame(prices, index=daily_index), pd.DataFrame(fill_rows), warnings, issues
+    return (
+        pd.DataFrame(prices, index=daily_index),
+        pd.DataFrame(fill_rows),
+        warnings,
+        issues,
+        latest_price_data_date,
+    )
 
 
 def build_daily_cash_series(
@@ -609,6 +640,11 @@ def build_daily_cash_series_from_changes(
 
     dropped_internal = int((~effective_mask).sum())
     if dropped_internal > 0:
+        preview_cols = [
+            col
+            for col in ["datetime", "description", "type", "currency", "raw_change", "change_eur_filled"]
+            if col in df.columns
+        ]
         warnings.append(
             f"Cash reconstruction: excluded {dropped_internal} internal transfer row(s) from change cumsum."
         )
@@ -619,7 +655,7 @@ def build_daily_cash_series_from_changes(
                 "examples": _format_preview_df(
                     df.loc[
                         ~effective_mask,
-                        ["datetime", "description", "type", "currency", "raw_change", "change_eur_filled"],
+                        preview_cols,
                     ],
                 ),
             }

@@ -14,17 +14,179 @@ When editing:
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
 from .reconciliation import TotalsResult
+
+PRODUCT_NAME_GROUP_COLS = ["instrument_id", "isin", "ticker", "is_etf"]
+
+
+def _normalize_text_value(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _join_unique_non_empty(values: pd.Series) -> str:
+    unique = sorted({_normalize_text_value(v) for v in values if _normalize_text_value(v) != ""})
+    return ", ".join(unique)
+
+
+def unify_holding_product_names(
+    holdings: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    if holdings is None:
+        return pd.DataFrame(), []
+    if holdings.empty:
+        return holdings.copy(), []
+
+    df = holdings.copy()
+    for col in PRODUCT_NAME_GROUP_COLS:
+        if col not in df.columns:
+            df[col] = np.nan
+    if "product" not in df.columns:
+        return df, []
+    if "account_label" not in df.columns:
+        df["account_label"] = np.nan
+
+    inconsistencies: list[dict[str, Any]] = []
+    for _, block in df.groupby(PRODUCT_NAME_GROUP_COLS, dropna=False, sort=False):
+        product_values = block["product"].map(_normalize_text_value)
+        ordered_products: list[str] = []
+        seen_products: set[str] = set()
+        for product_name in product_values:
+            if product_name not in seen_products:
+                seen_products.add(product_name)
+                ordered_products.append(product_name)
+        if len(ordered_products) <= 1:
+            continue
+
+        chosen_product = ordered_products[0]
+        df.loc[block.index, "product"] = chosen_product
+
+        group_df = block.loc[:, PRODUCT_NAME_GROUP_COLS].head(1).reset_index(drop=True).copy()
+        product_rows: list[dict[str, Any]] = []
+        for product_name in ordered_products:
+            mask = product_values.eq(product_name)
+            row: dict[str, Any] = {
+                "product": product_name,
+                "occurrences": int(mask.sum()),
+            }
+            account_label = _join_unique_non_empty(block.loc[mask, "account_label"])
+            if account_label != "":
+                row["account_label"] = account_label
+            product_rows.append(row)
+        products_df = pd.DataFrame(product_rows)
+        product_cols = [col for col in ["product", "account_label", "occurrences"] if col in products_df.columns]
+
+        inconsistencies.append(
+            {
+                "group": group_df,
+                "products": products_df.loc[:, product_cols].reset_index(drop=True),
+                "chosen_product": chosen_product,
+            }
+        )
+    return df, inconsistencies
+
+
+def build_latest_valued_holdings(
+    holdings: pd.DataFrame,
+    *,
+    positions: pd.DataFrame | None = None,
+    prices_eur: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if holdings is None or holdings.empty:
+        return pd.DataFrame()
+
+    aggregated = aggregate_holdings(holdings)
+    if aggregated.empty:
+        return aggregated
+
+    out = aggregated.copy()
+    raw_qty = pd.to_numeric(out.get("quantity"), errors="coerce").abs()
+    raw_value_abs = pd.to_numeric(out.get("value_eur"), errors="coerce").abs()
+    fallback_px = np.where(raw_qty > 1e-12, raw_value_abs / raw_qty, np.nan)
+
+    latest_qty_map: dict[str, float] = {}
+    if isinstance(positions, pd.DataFrame) and not positions.empty:
+        latest_positions = positions.iloc[-1]
+        latest_qty_map = {
+            str(idx): float(val)
+            for idx, val in latest_positions.items()
+            if pd.notna(val) and np.isfinite(float(val))
+        }
+
+    latest_price_map: dict[str, float] = {}
+    if isinstance(prices_eur, pd.DataFrame) and not prices_eur.empty:
+        latest_prices = prices_eur.iloc[-1]
+        latest_price_map = {
+            str(idx): float(val)
+            for idx, val in latest_prices.items()
+            if pd.notna(val) and np.isfinite(float(val))
+        }
+
+    out["quantity"] = out["instrument_id"].map(lambda iid: latest_qty_map.get(str(iid), np.nan))
+    out["quantity"] = out["quantity"].where(out["quantity"].notna(), raw_qty).abs()
+    out["last_px_eur"] = out["instrument_id"].map(lambda iid: latest_price_map.get(str(iid), np.nan))
+    out["last_px_eur"] = out["last_px_eur"].where(pd.to_numeric(out["last_px_eur"], errors="coerce").notna(), fallback_px)
+    recomputed_value = pd.to_numeric(out["quantity"], errors="coerce") * pd.to_numeric(
+        out["last_px_eur"],
+        errors="coerce",
+    )
+    out["value_eur"] = np.where(recomputed_value.notna(), recomputed_value, raw_value_abs)
+    out["value_eur"] = pd.to_numeric(out["value_eur"], errors="coerce").fillna(0.0).abs()
+    return out
+
+
+def apply_ranked_target_per_holding_pct(
+    holdings: pd.DataFrame,
+    *,
+    target_etf_pct: float,
+    target_non_etf_pct: float,
+    desired_etf_holdings: int,
+    desired_non_etf_holdings: int,
+) -> pd.DataFrame:
+    if holdings is None or holdings.empty:
+        return pd.DataFrame() if holdings is None else holdings.copy()
+
+    out = holdings.copy()
+    out["value_eur"] = pd.to_numeric(out.get("value_eur"), errors="coerce")
+    out["is_etf"] = out.get("is_etf", False)
+    out["is_etf"] = out["is_etf"].fillna(False).astype(bool)
+    out["target_per_holding_pct"] = 0.0
+    out["target_rank_in_segment"] = np.nan
+
+    segment_specs = [
+        (True, float(target_etf_pct), max(int(desired_etf_holdings), 0)),
+        (False, float(target_non_etf_pct), max(int(desired_non_etf_holdings), 0)),
+    ]
+    for is_etf_value, segment_target_pct, desired_count in segment_specs:
+        segment_idx = (
+            out.loc[out["is_etf"].eq(is_etf_value)]
+            .sort_values("value_eur", ascending=False, na_position="last")
+            .index
+        )
+        if len(segment_idx) == 0:
+            continue
+        out.loc[segment_idx, "target_rank_in_segment"] = np.arange(1, len(segment_idx) + 1, dtype=float)
+        if desired_count <= 0:
+            continue
+        kept_idx = list(segment_idx[:desired_count])
+        if kept_idx:
+            out.loc[kept_idx, "target_per_holding_pct"] = segment_target_pct / desired_count
+    return out
 
 
 def build_four_tables(
     *,
     holdings: pd.DataFrame,
     totals: TotalsResult,
-    target_etf_fraction: float,
+    target_etf_pct: float,
+    target_non_etf_pct: float,
+    target_cash_pct: float,
     desired_etf_holdings: int,
     desired_non_etf_holdings: int,
     min_over_value_eur: float,
@@ -37,12 +199,12 @@ def build_four_tables(
     total_value = float(totals.total_value_eur)
     aggregated["value_pct"] = np.where(total_value != 0, aggregated["value_eur"] / total_value * 100.0, np.nan)
 
-    n_etf = max(int(desired_etf_holdings), 1)
-    n_non_etf = max(int(desired_non_etf_holdings), 1)
-    aggregated["target_per_holding_pct"] = np.where(
-        aggregated["is_etf"],
-        target_etf_fraction / n_etf * 100.0,
-        (1.0 - target_etf_fraction) / n_non_etf * 100.0,
+    aggregated = apply_ranked_target_per_holding_pct(
+        aggregated,
+        target_etf_pct=float(target_etf_pct),
+        target_non_etf_pct=float(target_non_etf_pct),
+        desired_etf_holdings=int(desired_etf_holdings),
+        desired_non_etf_holdings=int(desired_non_etf_holdings),
     )
     aggregated["target_value_eur"] = aggregated["target_per_holding_pct"] / 100.0 * total_value
     aggregated["over_target_eur"] = aggregated["value_eur"] - aggregated["target_value_eur"]
@@ -58,8 +220,49 @@ def build_four_tables(
     non_etf_value = float(non_etf["value_eur"].sum())
     cash_value = float(totals.cash_value_eur)
     combined_value = float(total_value)
-    eur_to_etf = target_etf_fraction * combined_value - etf_value
-    eur_to_non_etf = (1.0 - target_etf_fraction) * combined_value - non_etf_value
+    target_etf_value = float(target_etf_pct) / 100.0 * combined_value
+    target_non_etf_value = float(target_non_etf_pct) / 100.0 * combined_value
+    target_cash_value = float(target_cash_pct) / 100.0 * combined_value
+    deployable_cash = max(cash_value - target_cash_value, 0.0)
+    etf_gap = max(target_etf_value - etf_value, 0.0)
+    non_etf_gap = max(target_non_etf_value - non_etf_value, 0.0)
+    gap_total = etf_gap + non_etf_gap
+    if deployable_cash > 0.0:
+        if gap_total > 0.0:
+            eur_to_etf = deployable_cash * etf_gap / gap_total
+            eur_to_non_etf = deployable_cash * non_etf_gap / gap_total
+        else:
+            invested_target_total = max(float(target_etf_pct) + float(target_non_etf_pct), 0.0)
+            if invested_target_total > 0.0:
+                eur_to_etf = deployable_cash * float(target_etf_pct) / invested_target_total
+                eur_to_non_etf = deployable_cash * float(target_non_etf_pct) / invested_target_total
+            else:
+                eur_to_etf = 0.0
+                eur_to_non_etf = 0.0
+    else:
+        eur_to_etf = 0.0
+        eur_to_non_etf = 0.0
+
+    cash_shortfall = max(target_cash_value - cash_value, 0.0)
+    etf_excess = max(etf_value - target_etf_value, 0.0)
+    non_etf_excess = max(non_etf_value - target_non_etf_value, 0.0)
+    excess_total = etf_excess + non_etf_excess
+    if cash_shortfall > 0.0:
+        if excess_total > 0.0:
+            etf_to_cash = cash_shortfall * etf_excess / excess_total
+            non_etf_to_cash = cash_shortfall * non_etf_excess / excess_total
+        else:
+            invested_current_total = max(etf_value + non_etf_value, 0.0)
+            if invested_current_total > 0.0:
+                etf_to_cash = cash_shortfall * etf_value / invested_current_total
+                non_etf_to_cash = cash_shortfall * non_etf_value / invested_current_total
+            else:
+                etf_to_cash = 0.0
+                non_etf_to_cash = 0.0
+    else:
+        etf_to_cash = 0.0
+        non_etf_to_cash = 0.0
+
     identity_total = etf_value + non_etf_value + cash_value
 
     summary = pd.DataFrame(
@@ -68,11 +271,16 @@ def build_four_tables(
             {"metric": "non-ETF value", "value_eur": non_etf_value},
             {"metric": "ETF value", "value_eur": etf_value},
             {"metric": "cash position", "value_eur": cash_value},
+            {"metric": "target non-ETF value", "value_eur": target_non_etf_value},
+            {"metric": "target ETF value", "value_eur": target_etf_value},
+            {"metric": "target cash position", "value_eur": target_cash_value},
             {"metric": "suggested EUR to ETF for next purchases", "value_eur": eur_to_etf},
             {
                 "metric": "suggested EUR to non-ETF for next purchases",
                 "value_eur": eur_to_non_etf,
             },
+            {"metric": "suggested EUR from ETF to cash", "value_eur": etf_to_cash},
+            {"metric": "suggested EUR from non-ETF to cash", "value_eur": non_etf_to_cash},
             {"metric": "check ETF + non-ETF + cash", "value_eur": identity_total},
             {"metric": "identity delta (should be 0)", "value_eur": identity_total - combined_value},
         ]
@@ -106,15 +314,11 @@ def build_four_tables(
 def aggregate_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
     if holdings.empty:
         return pd.DataFrame()
-    df = holdings.copy()
+    df, _ = unify_holding_product_names(holdings)
     group_cols = ["instrument_id", "product", "isin", "ticker", "is_etf"]
 
-    def joined_accounts(values: pd.Series) -> str:
-        unique = sorted({str(v) for v in values.dropna().unique()})
-        return ", ".join(unique)
-
     grouped = df.groupby(group_cols, dropna=False, as_index=False).agg(
-        account_label=("account_label", joined_accounts),
+        account_label=("account_label", _join_unique_non_empty),
         quantity=("quantity", "sum"),
         value_eur=("value_eur", "sum"),
     )

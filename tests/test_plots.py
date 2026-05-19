@@ -143,6 +143,7 @@ def test_holdings_segment_pie_highlights_over_target_slices() -> None:
         holdings_df=holdings,
         title="ETF holdings (% of ETF sleeve)",
         total_portfolio_value_eur=2_000.0,
+        target_total_pct=50.0,
     )
 
     assert len(fig.data) == 1
@@ -157,6 +158,7 @@ def test_holdings_segment_pie_highlights_over_target_slices() -> None:
     assert "Portfolio weight:" in str(trace.hovertext[0])
     assert "ETF/non-ETF sleeve weight:" in str(trace.hovertext[0])
     assert "Over target: EUR 150.00" in str(trace.hovertext[0])
+    assert fig.layout.annotations[0].text == "Target: 50.0%"
 
 
 def test_degiro_quarterly_costs_figure_has_stacked_dataset_traces() -> None:

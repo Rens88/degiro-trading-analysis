@@ -19,6 +19,7 @@ When editing:
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import time
@@ -48,8 +49,9 @@ from .config import (
     DEFAULT_MIN_OVER_VALUE_EUR,
     DEFAULT_TICKER_CLASSIFICATION_PATH,
     REQUIRED_DATASET_FILES,
+    DEFAULT_TARGET_ETF_PCT,
+    DEFAULT_TARGET_NON_ETF_PCT,
     DEFAULT_TARGET_CASH_PCT,
-    DEFAULT_TARGET_ETF_FRACTION,
     DEFAULT_TARGET_INDUSTRY_PCT,
     DEFAULT_TARGET_STYLE_PCT,
     SAMPLE_DATASETS,
@@ -59,6 +61,7 @@ from .config import (
     STATE_RELOADING_EXPORT,
     STATE_SELECTING_PARAMS,
     STATE_VIEWING_RESULTS,
+    resolve_portfolio_target_split,
 )
 from .data_import import LoadedDataset, load_dataset, validate_uploaded_file_set
 from .exceptions import UserFacingError
@@ -93,7 +96,12 @@ from .reconciliation import (
     reconcile_dataset,
     reconciliation_table,
 )
-from .tables import build_four_tables, build_monthly_starting_portfolio_value_table
+from .tables import (
+    build_four_tables,
+    build_latest_valued_holdings,
+    build_monthly_starting_portfolio_value_table,
+    unify_holding_product_names,
+)
 
 
 MANUAL_MONTHLY_TRACKED_VALUES_RAW: list[tuple[str, str]] = [
@@ -282,10 +290,7 @@ def load_strategy_file(
         raw_strategy = {}
 
     strategy = {
-        "target_etf_fraction": _to_float_or_default(
-            raw_strategy.get("target_etf_fraction"),
-            DEFAULT_TARGET_ETF_FRACTION,
-        ),
+        **resolve_portfolio_target_split(raw_strategy),
         "desired_etf_holdings": _to_int_or_default(
             raw_strategy.get("desired_etf_holdings"),
             DEFAULT_DESIRED_ETF_HOLDINGS,
@@ -294,7 +299,6 @@ def load_strategy_file(
             raw_strategy.get("desired_non_etf_holdings"),
             DEFAULT_DESIRED_NON_ETF_HOLDINGS,
         ),
-        "target_cash_pct": _to_float_or_default(raw_strategy.get("target_cash_pct"), DEFAULT_TARGET_CASH_PCT),
         "max_single_holding_pct": _to_float_or_default(
             raw_strategy.get("max_single_holding_pct"),
             DEFAULT_MAX_SINGLE_HOLDING_PCT,
@@ -360,10 +364,11 @@ def apply_loaded_strategy_to_session_state(
     data_sources: dict[str, str],
 ) -> None:
     scalar_keys = [
-        "target_etf_fraction",
+        "target_etf_pct",
+        "target_non_etf_pct",
+        "target_cash_pct",
         "desired_etf_holdings",
         "desired_non_etf_holdings",
-        "target_cash_pct",
         "max_single_holding_pct",
         "max_top5_holdings_pct",
         "max_single_currency_pct",
@@ -634,18 +639,35 @@ def render_sidebar(*, logger: Any) -> None:
             "deviation views."
         ),
     )
-    target_etf_fraction = st.sidebar.slider(
-        "target_etf_fraction",
+    st.sidebar.header("Spread Strategy")
+    target_etf_pct_input = st.sidebar.number_input(
+        "target_etf_pct",
         min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.get("target_etf_fraction", DEFAULT_TARGET_ETF_FRACTION)),
-        step=0.01,
+        max_value=100.0,
+        value=float(st.session_state.get("target_etf_pct", DEFAULT_TARGET_ETF_PCT)),
+        step=0.5,
         disabled=not at_or_after(STATE_SELECTING_PARAMS),
-        help=(
-            "Target fraction of invested holdings in ETFs (0.50 means 50% ETFs, "
-            "50% non-ETFs)."
-        ),
+        help="Target ETF percentage of total portfolio value.",
     )
+    target_non_etf_pct_input = st.sidebar.number_input(
+        "target_non_etf_pct",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(st.session_state.get("target_non_etf_pct", DEFAULT_TARGET_NON_ETF_PCT)),
+        step=0.5,
+        disabled=not at_or_after(STATE_SELECTING_PARAMS),
+        help="Target non-ETF percentage of total portfolio value.",
+    )
+    target_split_sum = float(target_etf_pct_input) + float(target_non_etf_pct_input)
+    target_split_valid = 0.0 <= target_split_sum <= 100.0
+    target_etf_pct = float(target_etf_pct_input)
+    target_non_etf_pct = float(target_non_etf_pct_input)
+    target_cash_pct = float(100.0 - target_split_sum) if target_split_valid else float("nan")
+    if target_split_valid:
+        st.sidebar.metric("target_cash_pct (auto)", f"{target_cash_pct:,.1f}%")
+    else:
+        st.sidebar.error("ETF % + non-ETF % must be between 0% and 100%.")
+        st.sidebar.metric("target_cash_pct (auto)", "Invalid")
     desired_etf_holdings = st.sidebar.number_input(
         "desired_etf_holdings",
         min_value=1,
@@ -674,16 +696,6 @@ def render_sidebar(*, logger: Any) -> None:
             "Minimum EUR deviation before an overweight/underweight position is "
             "flagged for action."
         ),
-    )
-    st.sidebar.header("Spread Strategy")
-    target_cash_pct = st.sidebar.slider(
-        "target_cash_pct",
-        min_value=0.0,
-        max_value=50.0,
-        value=float(st.session_state.get("target_cash_pct", DEFAULT_TARGET_CASH_PCT)),
-        step=0.5,
-        disabled=not at_or_after(STATE_SELECTING_PARAMS),
-        help="Target cash percentage of total portfolio value.",
     )
     max_single_holding_pct = st.sidebar.slider(
         "max_single_holding_pct",
@@ -793,11 +805,12 @@ def render_sidebar(*, logger: Any) -> None:
     params = {
         "lookback_months": int(lookback_months),
         "median_window_months": int(median_window_months),
-        "target_etf_fraction": float(target_etf_fraction),
+        "target_etf_pct": float(target_etf_pct),
+        "target_non_etf_pct": float(target_non_etf_pct),
+        "target_cash_pct": float(target_cash_pct),
         "desired_etf_holdings": int(desired_etf_holdings),
         "desired_non_etf_holdings": int(desired_non_etf_holdings),
         "min_over_value_eur": float(min_over_value_eur),
-        "target_cash_pct": float(target_cash_pct),
         "max_single_holding_pct": float(max_single_holding_pct),
         "max_top5_holdings_pct": float(max_top5_holdings_pct),
         "max_single_currency_pct": float(max_single_currency_pct),
@@ -813,15 +826,17 @@ def render_sidebar(*, logger: Any) -> None:
         st.session_state["strategy_load_requested_path"] = str(strategy_file_path)
         st.rerun()
 
-    if strategy_action_cols[1].button("Save strategy", disabled=not at_or_after(STATE_SELECTING_PARAMS)):
+    save_strategy_disabled = (not at_or_after(STATE_SELECTING_PARAMS)) or (not target_split_valid)
+    if strategy_action_cols[1].button("Save strategy", disabled=save_strategy_disabled):
         try:
             strategy_save_path = save_strategy_file(
                 strategy_file_path=strategy_file_path,
                 strategy={
-                    "target_etf_fraction": float(params["target_etf_fraction"]),
+                    "target_etf_pct": float(params["target_etf_pct"]),
+                    "target_non_etf_pct": float(params["target_non_etf_pct"]),
+                    "target_cash_pct": float(params["target_cash_pct"]),
                     "desired_etf_holdings": int(params["desired_etf_holdings"]),
                     "desired_non_etf_holdings": int(params["desired_non_etf_holdings"]),
-                    "target_cash_pct": float(params["target_cash_pct"]),
                     "max_single_holding_pct": float(params["max_single_holding_pct"]),
                     "max_top5_holdings_pct": float(params["max_top5_holdings_pct"]),
                     "max_single_currency_pct": float(params["max_single_currency_pct"]),
@@ -853,18 +868,18 @@ def render_sidebar(*, logger: Any) -> None:
 
     auto_ran = False
     startup_autorun_pending = bool(st.session_state.pop("startup_autorun_pending", False))
-    if startup_autorun_pending and at_or_after(STATE_SELECTING_PARAMS):
+    if startup_autorun_pending and at_or_after(STATE_SELECTING_PARAMS) and target_split_valid:
         transition(STATE_PROCESSING, "Startup auto-load requested immediate analysis")
         run_analysis(params=params, logger=logger)
         auto_ran = True
 
-    if second_dataset_just_loaded and at_or_after(STATE_SELECTING_PARAMS) and not auto_ran:
+    if second_dataset_just_loaded and at_or_after(STATE_SELECTING_PARAMS) and target_split_valid and not auto_ran:
         transition(STATE_PROCESSING, "Second dataset loaded; auto-run analysis")
         run_analysis(params=params, logger=logger)
         auto_ran = True
 
     datasets_loaded = len(st.session_state["workflow"]["datasets"]) > 0
-    run_disabled = not datasets_loaded or not at_or_after(STATE_SELECTING_PARAMS)
+    run_disabled = (not datasets_loaded) or (not at_or_after(STATE_SELECTING_PARAMS)) or (not target_split_valid)
     if st.sidebar.button("Run analysis", disabled=run_disabled) and not auto_ran:
         transition(STATE_PROCESSING, "User clicked Run analysis")
         run_analysis(params=params, logger=logger)
@@ -1313,7 +1328,9 @@ def process_loaded_datasets(
     cash_results: dict[str, CashReconciliationResult] = {}
     totals_results: dict[str, TotalsResult] = {}
     per_dataset_timeseries: dict[str, Any] = {}
+    source_date_ranges: dict[str, dict[str, pd.Timestamp]] = {}
     issue_tables: list[dict[str, Any]] = []
+    analysis_end_date = pd.Timestamp.today().normalize()
 
     for key, dataset in datasets.items():
         cash_result, totals_result = reconcile_dataset(
@@ -1324,6 +1341,12 @@ def process_loaded_datasets(
         )
         cash_results[dataset.account_label] = cash_result
         totals_results[dataset.account_label] = totals_result
+        first_date, last_date = dataset_activity_date_range(dataset)
+        if pd.notna(first_date) and pd.notna(last_date):
+            source_date_ranges[dataset.account_label] = {
+                "first_date": pd.Timestamp(first_date).normalize(),
+                "last_date": pd.Timestamp(last_date).normalize(),
+            }
         for issue in dataset.issues:
             issue_tables.append(
                 {
@@ -1357,6 +1380,7 @@ def process_loaded_datasets(
         transactions=merged_transactions,
         account=merged_account,
         instruments=merged_instruments,
+        end_date_override=analysis_end_date,
         cache_dir="cache",
         logger=logger,
     )
@@ -1375,6 +1399,7 @@ def process_loaded_datasets(
             transactions=dataset.transactions,
             account=dataset.account,
             instruments=dataset.instruments,
+            end_date_override=analysis_end_date,
             cache_dir="cache",
             logger=logger,
         )
@@ -1389,11 +1414,33 @@ def process_loaded_datasets(
                 }
             )
 
-    holdings_for_tables = merged_portfolio.loc[~merged_portfolio["is_cash_like"]].copy()
+    holdings_for_tables_raw = merged_portfolio.loc[~merged_portfolio["is_cash_like"]].copy()
+    holdings_for_tables_raw, product_name_inconsistencies = unify_holding_product_names(holdings_for_tables_raw)
+    holdings_for_tables = build_latest_valued_holdings(
+        holdings_for_tables_raw,
+        positions=ts_result.positions,
+        prices_eur=ts_result.prices_eur,
+    )
+    latest_metrics = ts_result.metrics.iloc[-1] if isinstance(ts_result.metrics, pd.DataFrame) and not ts_result.metrics.empty else pd.Series(dtype="float64")
+    rebuilt_cash_value = _to_float_or_default(latest_metrics.get("cash"), float(combined_totals_sum.cash_value_eur))
+    rebuilt_total_value = _to_float_or_default(
+        latest_metrics.get("portfolio_value"),
+        float(pd.to_numeric(holdings_for_tables.get("value_eur"), errors="coerce").sum() + rebuilt_cash_value),
+    )
+    rebuilt_positions_value = float(pd.to_numeric(holdings_for_tables.get("value_eur"), errors="coerce").sum())
+    table_totals = TotalsResult(
+        account_label="Combined",
+        positions_value_eur=rebuilt_positions_value,
+        cash_value_eur=rebuilt_cash_value,
+        cash_source="rebuilt_latest_prices",
+        total_value_eur=rebuilt_total_value,
+    )
     table_outputs = build_four_tables(
         holdings=holdings_for_tables,
-        totals=combined_totals_sum,
-        target_etf_fraction=float(params["target_etf_fraction"]),
+        totals=table_totals,
+        target_etf_pct=float(params["target_etf_pct"]),
+        target_non_etf_pct=float(params["target_non_etf_pct"]),
+        target_cash_pct=float(params["target_cash_pct"]),
         desired_etf_holdings=int(params["desired_etf_holdings"]),
         desired_non_etf_holdings=int(params["desired_non_etf_holdings"]),
         min_over_value_eur=float(params["min_over_value_eur"]),
@@ -1404,18 +1451,19 @@ def process_loaded_datasets(
     )
     spread_analysis = build_ai_spread_analysis(
         holdings_df=holdings_for_tables,
-        total_value_eur=float(combined_totals_sum.total_value_eur),
-        cash_value_eur=float(combined_totals_sum.cash_value_eur),
+        total_value_eur=float(rebuilt_total_value),
+        cash_value_eur=float(rebuilt_cash_value),
         cash_detail_df=(
             cash_results["Combined"].detail
             if "Combined" in cash_results and hasattr(cash_results["Combined"], "detail")
             else pd.DataFrame()
         ),
         strategy={
-            "target_etf_fraction": float(params["target_etf_fraction"]),
+            "target_etf_pct": float(params["target_etf_pct"]),
+            "target_non_etf_pct": float(params["target_non_etf_pct"]),
+            "target_cash_pct": float(params["target_cash_pct"]),
             "desired_etf_holdings": int(params["desired_etf_holdings"]),
             "desired_non_etf_holdings": int(params["desired_non_etf_holdings"]),
-            "target_cash_pct": float(params["target_cash_pct"]),
             "max_single_holding_pct": float(params["max_single_holding_pct"]),
             "max_top5_holdings_pct": float(params["max_top5_holdings_pct"]),
             "max_single_currency_pct": float(params["max_single_currency_pct"]),
@@ -1591,6 +1639,7 @@ def process_loaded_datasets(
         "account_df": merged_account,
         "timeseries": ts_result,
         "per_dataset_timeseries": per_dataset_timeseries,
+        "source_date_ranges": source_date_ranges,
         "snapshot_vs_rebuilt_df": snapshot_vs_rebuilt_df,
         "positions_reconciliation_df": positions_reconciliation_df,
         "latest_balance_check_df": latest_balance_check_df,
@@ -1616,11 +1665,28 @@ def process_loaded_datasets(
         "ai_period_fig": ai_period_fig,
         "ai_drawdown_fig": ai_drawdown_fig,
         "ai_cash_allocation_fig": ai_cash_allocation_fig,
+        "data_inconsistency_report": {
+            "product_name_inconsistencies": product_name_inconsistencies,
+        },
         "offline_mode": bool(cache_runtime_state.get("offline_mode", False)),
         "offline_cached_from": cache_runtime_state.get("offline_cached_from"),
         "warnings": warnings,
         "issue_tables": issue_tables,
     }
+
+
+def dataset_activity_date_range(dataset: LoadedDataset) -> tuple[pd.Timestamp, pd.Timestamp]:
+    candidates: list[pd.Series] = []
+    for frame in [dataset.transactions, dataset.account]:
+        if not isinstance(frame, pd.DataFrame) or "datetime" not in frame.columns:
+            continue
+        dt = pd.to_datetime(frame["datetime"], errors="coerce").dropna()
+        if not dt.empty:
+            candidates.append(dt)
+    if not candidates:
+        return pd.NaT, pd.NaT
+    combined = pd.concat(candidates, ignore_index=True)
+    return combined.min().normalize(), combined.max().normalize()
 
 
 def merge_instruments(instruments_list: list[pd.DataFrame]) -> pd.DataFrame:
@@ -1769,12 +1835,19 @@ def render_main(*, logger: Any) -> None:
         return
 
     per_dataset_timeseries = processed.get("per_dataset_timeseries", {})
+    source_date_ranges = processed.get("source_date_ranges", {})
     panel_to_account_label = processed.get("panel_to_account_label", {})
     spread_analysis = processed.get("spread_analysis", {})
     performance_dashboard = processed.get("performance_dashboard", {})
     tables_data = processed.get("tables", {})
+    data_inconsistency_report = processed.get("data_inconsistency_report", {})
     offline_mode = bool(processed.get("offline_mode", False))
     offline_cached_from = processed.get("offline_cached_from")
+    product_name_inconsistencies = (
+        data_inconsistency_report.get("product_name_inconsistencies", [])
+        if isinstance(data_inconsistency_report, dict)
+        else []
+    )
 
     def _fmt_day(value: pd.Timestamp) -> str:
         return value.strftime("%d-%b-%Y").lower()
@@ -1791,16 +1864,125 @@ def render_main(*, logger: Any) -> None:
             return "N/A"
         return f"EUR {value:,.2f}"
 
+    def _fmt_eur_symbol(value: float, decimals: int = 2) -> str:
+        if not np.isfinite(value):
+            return "N/A"
+        if decimals <= 0:
+            return f"€{value:,.0f}"
+        return f"€{value:,.{decimals}f}"
+
     def _fmt_pct(value: float) -> str:
         if not np.isfinite(value):
             return "N/A"
         return f"{value:,.1f}%"
+
+    def _fmt_pct_spaced(value: float) -> str:
+        if not np.isfinite(value):
+            return "N/A"
+        return f"{value:,.1f} %"
 
     def _fmt_offline_cached_from(value: Any) -> str:
         ts = pd.to_datetime(value, errors="coerce")
         if pd.isna(ts):
             return "unknown time"
         return ts.strftime("%H:%M:%S %d-%m-%Y")
+
+    def _inject_overview_kpi_styles() -> None:
+        st.markdown(
+            """
+            <style>
+            .overview-kpi-card {
+                height: clamp(128px, 13vw, 152px);
+                min-height: clamp(128px, 13vw, 152px);
+                border-radius: 0.75rem;
+                border: 1px solid rgba(128, 128, 128, 0.28);
+                background: var(--secondary-background-color);
+                padding: 0.85rem 0.95rem;
+                display: flex;
+                flex-direction: column;
+                justify-content: space-between;
+                gap: 0.55rem;
+            }
+            .overview-kpi-tooltip {
+                position: relative;
+                height: 100%;
+            }
+            .overview-kpi-card--alert {
+                border-color: rgba(225, 1, 26, 0.45);
+                background: rgba(225, 1, 26, 0.14);
+            }
+            .overview-kpi-label {
+                color: var(--text-color);
+                opacity: 0.72;
+                font-size: 0.84rem;
+                line-height: 1.25;
+            }
+            .overview-kpi-value {
+                color: var(--primary-color);
+                font-size: 1.18rem;
+                font-weight: 700;
+                line-height: 1.25;
+                word-break: break-word;
+                white-space: normal;
+            }
+            .overview-kpi-card--alert .overview-kpi-label,
+            .overview-kpi-card--alert .overview-kpi-value {
+                color: #E1011A;
+                opacity: 1;
+            }
+            .overview-kpi-tooltip-box {
+                position: absolute;
+                left: 50%;
+                top: calc(100% + 0.45rem);
+                transform: translateX(-50%);
+                width: min(280px, 88vw);
+                border-radius: 0.65rem;
+                border: 1px solid rgba(128, 128, 128, 0.32);
+                background: var(--background-color);
+                color: var(--text-color);
+                box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+                padding: 0.7rem 0.8rem;
+                font-size: 0.78rem;
+                line-height: 1.4;
+                white-space: normal;
+                opacity: 0;
+                visibility: hidden;
+                pointer-events: none;
+                z-index: 1000;
+            }
+            .overview-kpi-tooltip:hover .overview-kpi-tooltip-box {
+                opacity: 1;
+                visibility: visible;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def _render_overview_kpi_card(
+        *,
+        title: str,
+        value: str,
+        tooltip: str,
+        alert: bool = False,
+    ) -> None:
+        variant_class = " overview-kpi-card--alert" if alert else ""
+        safe_title = html.escape(str(title))
+        safe_value = html.escape(str(value))
+        safe_value = safe_value.replace("\n", "<br>")
+        safe_tooltip = html.escape(str(tooltip)).replace("\n", "<br>")
+        st.markdown(
+            (
+                '<div class="overview-kpi-tooltip">'
+                f'<div class="overview-kpi-card{variant_class}">'
+                f'<div class="overview-kpi-label">{safe_title}</div>'
+                f'<div class="overview-kpi-value">{safe_value}</div>'
+                "</div>"
+                f'<div class="overview-kpi-tooltip-box">{safe_tooltip}</div>'
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
 
     def _delta_mask(df: pd.DataFrame, delta_col: str) -> pd.Series:
         if not isinstance(df, pd.DataFrame):
@@ -1905,12 +2087,16 @@ def render_main(*, logger: Any) -> None:
         )
     for panel_key in sorted(panel_to_account_label.keys()):
         account_label = panel_to_account_label[panel_key]
-        ts_single = per_dataset_timeseries.get(account_label)
-        metrics_df = getattr(ts_single, "metrics", pd.DataFrame())
-        if not isinstance(metrics_df, pd.DataFrame) or metrics_df.empty:
-            continue
-        first_date = pd.to_datetime(metrics_df.index.min(), errors="coerce")
-        last_date = pd.to_datetime(metrics_df.index.max(), errors="coerce")
+        range_info = source_date_ranges.get(account_label, {}) if isinstance(source_date_ranges, dict) else {}
+        first_date = pd.to_datetime(range_info.get("first_date"), errors="coerce")
+        last_date = pd.to_datetime(range_info.get("last_date"), errors="coerce")
+        if pd.isna(first_date) or pd.isna(last_date):
+            ts_single = per_dataset_timeseries.get(account_label)
+            metrics_df = getattr(ts_single, "metrics", pd.DataFrame())
+            if not isinstance(metrics_df, pd.DataFrame) or metrics_df.empty:
+                continue
+            first_date = pd.to_datetime(metrics_df.index.min(), errors="coerce")
+            last_date = pd.to_datetime(metrics_df.index.max(), errors="coerce")
         if pd.isna(first_date) or pd.isna(last_date):
             continue
         panel_name = panel_key.replace("_", " ").title().strip()
@@ -1922,8 +2108,18 @@ def render_main(*, logger: Any) -> None:
         else:
             display_label = panel_name
         date_lines.append(f"{display_label}: {_fmt_day(first_date)} to {_fmt_day(last_date)}")
+    latest_price_data_date = pd.to_datetime(
+        getattr(processed.get("timeseries"), "latest_price_data_date", None),
+        errors="coerce",
+    )
+    if pd.notna(latest_price_data_date):
+        date_lines.append(
+            f"Most recent stock data successfully fetched: {_fmt_day(pd.Timestamp(latest_price_data_date))}"
+        )
+    else:
+        date_lines.append("Most recent stock data successfully fetched: unavailable")
     if date_lines:
-        st.caption("Loaded data date ranges (first to last):")
+        st.caption("Loaded data date ranges (first to last), plus latest market-data date:")
         for line in date_lines:
             st.caption(f"- {line}")
 
@@ -1949,22 +2145,55 @@ def render_main(*, logger: Any) -> None:
     if isinstance(metrics_df, pd.DataFrame) and not metrics_df.empty:
         latest_metrics = metrics_df.iloc[-1]
     latest_total_deposits = _to_float(latest_metrics.get("total_deposits", np.nan))
-    latest_total_value = _to_float(latest_metrics.get("portfolio_value", np.nan))
-    latest_cash = _to_float(latest_metrics.get("cash", np.nan))
+    summary_df = tables_data.get("summary", pd.DataFrame())
+    latest_total_value = value_from_summary(summary_df, "combined value")
+    if not np.isfinite(latest_total_value):
+        latest_total_value = _to_float(latest_metrics.get("portfolio_value", np.nan))
+    latest_cash = value_from_summary(summary_df, "cash position")
+    if not np.isfinite(latest_cash):
+        latest_cash = _to_float(latest_metrics.get("cash", np.nan))
+    latest_profit_hypothetical = (
+        latest_total_value - latest_total_deposits
+        if np.isfinite(latest_total_value) and np.isfinite(latest_total_deposits)
+        else float("nan")
+    )
 
     etf_pct = float("nan")
     non_etf_pct = float("nan")
-    if isinstance(spread_analysis, dict):
+    cash_pct = float("nan")
+    summary_etf_value = value_from_summary(summary_df, "ETF value")
+    summary_non_etf_value = value_from_summary(summary_df, "non-ETF value")
+    summary_split_available = (
+        np.isfinite(latest_total_value)
+        and latest_total_value > 0.0
+        and np.isfinite(summary_etf_value)
+        and np.isfinite(summary_non_etf_value)
+        and np.isfinite(latest_cash)
+    )
+    if summary_split_available:
+        etf_pct = summary_etf_value / latest_total_value * 100.0
+        non_etf_pct = summary_non_etf_value / latest_total_value * 100.0
+        cash_pct = latest_cash / latest_total_value * 100.0
+    elif isinstance(spread_analysis, dict):
         etf_non_etf_df = spread_analysis.get("etf_non_etf_df", pd.DataFrame())
-    else:
-        etf_non_etf_df = pd.DataFrame()
-    if isinstance(etf_non_etf_df, pd.DataFrame) and not etf_non_etf_df.empty:
-        etf_row = etf_non_etf_df.loc[etf_non_etf_df["segment"] == "ETF"]
-        non_etf_row = etf_non_etf_df.loc[etf_non_etf_df["segment"] == "Non-ETF"]
-        if not etf_row.empty:
-            etf_pct = _to_float(etf_row.iloc[0].get("share_pct_total", np.nan))
-        if not non_etf_row.empty:
-            non_etf_pct = _to_float(non_etf_row.iloc[0].get("share_pct_total", np.nan))
+        if isinstance(etf_non_etf_df, pd.DataFrame) and not etf_non_etf_df.empty:
+            etf_row = etf_non_etf_df.loc[etf_non_etf_df["segment"] == "ETF"]
+            non_etf_row = etf_non_etf_df.loc[etf_non_etf_df["segment"] == "Non-ETF"]
+            cash_row = etf_non_etf_df.loc[etf_non_etf_df["segment"] == "Cash"]
+            if not etf_row.empty:
+                etf_pct = _to_float(etf_row.iloc[0].get("share_pct_total", np.nan))
+            if not non_etf_row.empty:
+                non_etf_pct = _to_float(non_etf_row.iloc[0].get("share_pct_total", np.nan))
+            if not cash_row.empty:
+                cash_pct = _to_float(cash_row.iloc[0].get("share_pct_total", np.nan))
+
+    display_etf_pct = etf_pct
+    display_non_etf_pct = non_etf_pct
+    display_cash_pct = cash_pct
+    if np.isfinite(etf_pct) and np.isfinite(non_etf_pct) and np.isfinite(cash_pct):
+        display_etf_pct = round(etf_pct, 1)
+        display_non_etf_pct = round(non_etf_pct, 1)
+        display_cash_pct = round(100.0 - display_etf_pct - display_non_etf_pct, 1)
 
     etf_over_count, non_etf_over_count = _count_over_target_by_segment()
     performance_summary = (
@@ -1976,6 +2205,9 @@ def render_main(*, logger: Any) -> None:
         performance_summary.get("all_time_investment_pnl_eur", np.nan)
     )
     savings_xirr_pct = _to_float(performance_summary.get("all_time_xirr_pct", np.nan))
+
+    def _card_tooltip(title: str, detail_lines: list[str]) -> str:
+        return f"{title}\n" + "\n".join(detail_lines)
 
     latest_price_by_instrument: dict[str, dict[str, Any]] = {}
     prices_eur_df = getattr(processed.get("timeseries"), "prices_eur", pd.DataFrame())
@@ -2077,60 +2309,100 @@ def render_main(*, logger: Any) -> None:
 
     with st.expander("Section 1: Overview", expanded=True):
         over_threshold_total = int(etf_over_count + non_etf_over_count)
+        _inject_overview_kpi_styles()
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1:
-            st.button(
-                f"Total net deposited\n{_fmt_eur(latest_total_deposits)}",
-                key="section1_kpi_net_deposited",
-                disabled=True,
-                width="stretch",
+            _render_overview_kpi_card(
+                title="Total net deposited",
+                value=_fmt_eur_symbol(latest_total_deposits, decimals=0),
+                tooltip=_card_tooltip(
+                    "Total net deposited",
+                    [
+                        "Cumulative external deposits minus external withdrawals at the latest analysis date.",
+                        f"Precise value: {_fmt_eur_symbol(latest_total_deposits, decimals=2)}",
+                    ],
+                ),
             )
         with c2:
-            st.button(
-                f"Current total value\n{_fmt_eur(latest_total_value)}",
-                key="section1_kpi_total_value",
-                disabled=True,
-                width="stretch",
+            _render_overview_kpi_card(
+                title="Current total value",
+                value=_fmt_eur_symbol(latest_total_value, decimals=0),
+                tooltip=_card_tooltip(
+                    "Current total value",
+                    [
+                        "Rebuilt portfolio value at the latest market-data date: holdings marked to latest known EUR prices plus reconstructed cash.",
+                        f"Precise value: {_fmt_eur_symbol(latest_total_value, decimals=2)}",
+                    ],
+                ),
             )
         with c3:
-            st.button(
-                f"Current cash position\n{_fmt_eur(latest_cash)}",
-                key="section1_kpi_cash",
-                disabled=True,
-                width="stretch",
+            _render_overview_kpi_card(
+                title="Current cash position",
+                value=_fmt_eur_symbol(latest_cash, decimals=0),
+                tooltip=_card_tooltip(
+                    "Current cash position",
+                    [
+                        "Reconstructed cash balance at the latest market-data date, based on account changes.",
+                        f"Precise value: {_fmt_eur_symbol(latest_cash, decimals=2)}",
+                    ],
+                ),
             )
         with c4:
-            st.button(
-                f"ETF / non-ETF split\n{_fmt_pct(etf_pct)} / {_fmt_pct(non_etf_pct)}",
-                key="section1_kpi_split",
-                disabled=True,
-                width="stretch",
+            _render_overview_kpi_card(
+                title="ETF / non-ETF / cash split",
+                value=(
+                    f"{_fmt_pct(display_etf_pct)} ETF\n"
+                    f"{_fmt_pct(display_non_etf_pct)} N-ETF\n"
+                    f"{_fmt_pct(display_cash_pct)} Cash"
+                ),
+                tooltip=_card_tooltip(
+                    "ETF / non-ETF / cash split",
+                    [
+                        "Current share of total portfolio value in each sleeve.",
+                        f"ETF precise: {_fmt_pct(etf_pct)}",
+                        f"N-ETF precise: {_fmt_pct(non_etf_pct)}",
+                        f"Cash precise: {_fmt_pct(cash_pct)}",
+                    ],
+                ),
             )
         with c5:
-            btn_text = f"Above strategy threshold\nETF {etf_over_count} | non-ETF {non_etf_over_count}"
-            try:
-                st.button(
-                    btn_text,
-                    key="section1_kpi_above_target",
-                    width="stretch",
-                    type="primary" if over_threshold_total > 0 else "secondary",
-                )
-            except TypeError:
-                st.button(
-                    btn_text,
-                    key="section1_kpi_above_target",
-                    width="stretch",
-                )
-        with c6:
-            st.button(
-                (
-                    f"Savings-equivalent interest\n{_fmt_eur(savings_interest_equivalent_eur)}"
-                    f" ({_fmt_pct(savings_xirr_pct)}/yr)"
+            _render_overview_kpi_card(
+                title="Above strategy threshold",
+                value=f"ETF: {etf_over_count}\nN-ETF: {non_etf_over_count}",
+                tooltip=_card_tooltip(
+                    "Above strategy threshold",
+                    [
+                        "Count of holdings above their target value by more than the configured minimum EUR threshold.",
+                        f"ETF count: {etf_over_count}",
+                        f"N-ETF count: {non_etf_over_count}",
+                    ],
                 ),
-                key="section1_kpi_savings_equivalent",
-                disabled=True,
-                width="stretch",
+                alert=over_threshold_total > 0,
             )
+        with c6:
+            _render_overview_kpi_card(
+                title="Savings-equivalent interest",
+                value=(
+                    f"{_fmt_eur_symbol(savings_interest_equivalent_eur, decimals=0)}"
+                    f"\n{_fmt_pct_spaced(savings_xirr_pct)}/yr"
+                ),
+                tooltip=_card_tooltip(
+                    "Savings-equivalent interest",
+                    [
+                        "All-time investment P/L from the performance dashboard, with XIRR shown as an annualized return.",
+                        "This is flow-aware and therefore not identical to raw current value minus total net deposited when the analysis starts with an existing portfolio base.",
+                        f"Precise investment P/L: {_fmt_eur_symbol(savings_interest_equivalent_eur, decimals=2)}",
+                        f"Precise XIRR: {_fmt_pct_spaced(savings_xirr_pct)}/yr",
+                    ],
+                ),
+            )
+        st.markdown(
+            (
+                f"**Profit (hypothetical):** "
+                f"<span style='color: var(--primary-color); font-weight: 700;'>{_fmt_eur_symbol(latest_profit_hypothetical, decimals=2)}</span>"
+            ),
+            unsafe_allow_html=True,
+        )
 
         st.subheader("Performance over time (deposits, value, simple return)")
         plotly_chart_stretch(processed.get("fig_performance_over_time"))
@@ -2151,8 +2423,38 @@ def render_main(*, logger: Any) -> None:
             else:
                 render_dataframe(recent_sells_df, width="stretch")
 
+    with st.expander("Section 2: Data Inconsistency", expanded=bool(product_name_inconsistencies)):
+        if product_name_inconsistencies:
+            st.error("Potentially consequential fix applied. Review the overridden product names below.")
+            st.write(
+                'For each ["instrument_id", "isin", "ticker", "is_etf"]-grouping for which the '
+                '"product" is not the same, the product was overruled with the first occurring '
+                "product name. This was the case for the following combinations:"
+            )
+            for idx, item in enumerate(product_name_inconsistencies, start=1):
+                st.markdown(f"**Inconsistent Product-combinations #{idx}**")
+                group_df = item.get("group", pd.DataFrame())
+                products_df = item.get("products", pd.DataFrame())
+                if isinstance(group_df, pd.DataFrame) and not group_df.empty:
+                    render_dataframe(group_df, width="stretch")
+                else:
+                    st.caption("No grouping details available.")
+                if isinstance(products_df, pd.DataFrame) and not products_df.empty:
+                    render_dataframe(products_df, width="stretch")
+                else:
+                    st.caption("No product variants recorded.")
+                chosen_product = str(item.get("chosen_product", "")).strip()
+                if chosen_product != "":
+                    st.caption(f'Applied fix: unified `product` to "{chosen_product}".')
+            st.warning(
+                "ASK YOURSELF: Are this product names correctly assumed to represent the same "
+                "product, or should they indeed be considered as different products?"
+            )
+        else:
+            st.write("No inconsitencies detected")
+
     validation_title = (
-        "Section 2: Validation "
+        "Section 3: Validation "
         f"(cash diff: {'YES' if cash_recon_has_warning else 'no'} | "
         f"portfolio diff: {'YES' if portfolio_recon_has_warning else 'no'})"
     )
@@ -2286,7 +2588,7 @@ def render_main(*, logger: Any) -> None:
         elif not processed.get("warnings"):
             st.info("No data quality diagnostics available.")
 
-    with st.expander("Section 3: DEGIRO costs", expanded=True):
+    with st.expander("Section 4: DEGIRO costs", expanded=True):
         st.subheader("Costs & Promo Income Totals Check")
         st.caption(
             "Absolute EUR subtotals per dataset. "
@@ -2307,17 +2609,29 @@ def render_main(*, logger: Any) -> None:
         )
         plotly_chart_stretch(processed.get("fig_degiro_costs_quarterly"))
 
-    with st.expander("Section 4: Outlook (simple)", expanded=True):
+    with st.expander("Section 5: Outlook (simple)", expanded=True):
         st.subheader("Stock Development Normalized to Rolling Median (Plotly)")
         plotly_chart_stretch(processed.get("fig_normalized"))
 
         st.subheader("Four tables")
         st.caption(
-            "target_per_holding_pct logic: first split by target_etf_fraction, then divide ETF share by "
-            "`desired_etf_holdings` and non-ETF share by `desired_non_etf_holdings`."
+            "value_eur is based on latest rebuilt quantity multiplied by the latest known EUR price when "
+            "available. target_per_holding_pct is assigned only to the top-ranked holdings by "
+            "value_eur within each segment: the top `desired_etf_holdings` ETFs split the ETF "
+            "target share, the top `desired_non_etf_holdings` non-ETFs split the non-ETF target "
+            "share, and lower-ranked holdings in the segment receive 0%."
         )
-        summary_df = tables_data.get("summary", pd.DataFrame())
         combined_portfolio_value = value_from_summary(summary_df, "combined value")
+        target_etf_total_pct = (
+            value_from_summary(summary_df, "target ETF value") / combined_portfolio_value * 100.0
+            if np.isfinite(combined_portfolio_value) and combined_portfolio_value > 0.0
+            else float("nan")
+        )
+        target_non_etf_total_pct = (
+            value_from_summary(summary_df, "target non-ETF value") / combined_portfolio_value * 100.0
+            if np.isfinite(combined_portfolio_value) and combined_portfolio_value > 0.0
+            else float("nan")
+        )
         etf_table = tables_data.get("etf", pd.DataFrame())
         non_etf_table = tables_data.get("non_etf", pd.DataFrame())
         over_target_table = tables_data.get("over_target", pd.DataFrame())
@@ -2371,6 +2685,7 @@ def render_main(*, logger: Any) -> None:
                     holdings_df=etf_pie_df,
                     title="ETF holdings (% of ETF sleeve)",
                     total_portfolio_value_eur=combined_portfolio_value,
+                    target_total_pct=target_etf_total_pct,
                 )
                 plotly_chart_stretch(etf_pie)
             with pie_right:
@@ -2378,6 +2693,7 @@ def render_main(*, logger: Any) -> None:
                     holdings_df=non_etf_pie_df,
                     title="Non-ETF holdings (% of non-ETF sleeve)",
                     total_portfolio_value_eur=combined_portfolio_value,
+                    target_total_pct=target_non_etf_total_pct,
                 )
                 plotly_chart_stretch(non_etf_pie)
             threshold_value = _to_float(
@@ -2391,7 +2707,7 @@ def render_main(*, logger: Any) -> None:
             else:
                 st.caption("Red and pulled slices are above target threshold.")
 
-    with st.expander("Section 5: Performance", expanded=True):
+    with st.expander("Section 6: Performance", expanded=True):
         st.caption(
             "All-time, yearly and quarterly performance with start value, net deposited, end value, "
             "platform costs, trade statistics, and TWR/IRR/XIRR."
@@ -2455,9 +2771,9 @@ def render_main(*, logger: Any) -> None:
                 else:
                     st.info("No benchmark statistics available.")
 
-    with st.expander("Section 6: AI Generated Spread Analysis", expanded=True):
+    with st.expander("Section 7: AI Generated Spread Analysis", expanded=True):
         st.caption(
-            "Spread diagnostics for ETF/non-ETF strategy, cash target, concentration risk, "
+            "Spread diagnostics for ETF/non-ETF/cash portfolio targets, concentration risk, "
             "currency and classification allocation, correlation overlap risk, and concrete next actions."
         )
         if not isinstance(spread_analysis, dict) or not spread_analysis:
@@ -2489,10 +2805,10 @@ def render_main(*, logger: Any) -> None:
 
             etf_non_etf_df = spread_analysis.get("etf_non_etf_df", pd.DataFrame())
             if isinstance(etf_non_etf_df, pd.DataFrame) and not etf_non_etf_df.empty:
-                st.markdown("**ETF and non-ETF mix**")
+                st.markdown("**ETF, non-ETF and cash mix**")
                 render_dataframe(etf_non_etf_df, width="stretch")
             else:
-                st.info("No ETF/non-ETF spread table available.")
+                st.info("No ETF/non-ETF/cash spread table available.")
 
         with tab_alloc:
             currency_df = spread_analysis.get("currency_allocation_df", pd.DataFrame())
