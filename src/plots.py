@@ -22,6 +22,111 @@ from plotly.subplots import make_subplots
 
 from .config import BASE_BLUE, BASE_GREEN, BASE_ORANGE, BASE_RED, BASE_YELLOW
 
+ETF_NORMALIZED_COLORS = (
+    BASE_BLUE,
+    "#1F4AA8",
+    "#3A63BE",
+    "#5A52C6",
+    "#7459C9",
+    "#9271D6",
+)
+
+NON_ETF_NORMALIZED_COLORS = (
+    BASE_ORANGE,
+    "#F28C28",
+    "#E85D04",
+    "#D95F0E",
+    "#D1495B",
+    BASE_RED,
+)
+
+DISTINCT_NORMALIZED_COLORS = (
+    "#636EFA",
+    "#EF553B",
+    "#00CC96",
+    "#AB63FA",
+    "#FFA15A",
+    "#19D3F3",
+    "#FF6692",
+    "#B6E880",
+    "#FF97FF",
+    "#FECB52",
+)
+
+
+def _normalized_group_color(*, is_etf: bool, group_index: int) -> str:
+    palette = ETF_NORMALIZED_COLORS if is_etf else NON_ETF_NORMALIZED_COLORS
+    return str(palette[group_index % len(palette)])
+
+
+def _distinct_normalized_color(group_index: int) -> str:
+    return str(DISTINCT_NORMALIZED_COLORS[group_index % len(DISTINCT_NORMALIZED_COLORS)])
+
+
+def _apply_lowpass_butterworth(
+    series: pd.Series,
+    *,
+    normalized_cutoff_ratio: float = 0.18,
+    order: int = 2,
+) -> pd.Series:
+    try:
+        from scipy.signal import butter, sosfiltfilt
+    except Exception:
+        return series
+
+    if not isinstance(series, pd.Series) or series.empty:
+        return series
+    if normalized_cutoff_ratio <= 0.0 or normalized_cutoff_ratio >= 1.0:
+        return series
+
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype="float64")
+    out = values.copy()
+    finite_mask = np.isfinite(values)
+    if finite_mask.sum() < max(20, 12 * order):
+        return pd.Series(out, index=series.index, dtype="float64")
+
+    if isinstance(series.index, pd.DatetimeIndex):
+        time_seconds = (series.index.view("int64") / 1_000_000_000.0).astype("float64")
+    else:
+        time_seconds = np.arange(len(series), dtype="float64")
+
+    start = None
+    segment_count = len(values)
+    for idx in range(segment_count + 1):
+        is_finite = idx < segment_count and finite_mask[idx]
+        if is_finite and start is None:
+            start = idx
+            continue
+        if is_finite or start is None:
+            continue
+
+        stop = idx
+        segment_slice = slice(start, stop)
+        segment_values = values[segment_slice]
+        segment_times = time_seconds[segment_slice]
+
+        if len(segment_values) >= max(20, 12 * order):
+            dt = np.diff(segment_times)
+            dt = dt[np.isfinite(dt) & (dt > 0.0)]
+            if dt.size > 0:
+                dt_median = float(np.median(dt))
+                fs = 1.0 / dt_median if dt_median > 0.0 else np.nan
+                if np.isfinite(fs) and fs > 0.0:
+                    nyquist = 0.5 * fs
+                    cutoff_hz = float(normalized_cutoff_ratio) * nyquist
+                    if 0.0 < cutoff_hz < nyquist:
+                        try:
+                            tu = np.arange(segment_times[0], segment_times[-1] + dt_median * 0.5, dt_median)
+                            yu = np.interp(tu, segment_times, segment_values)
+                            sos = butter(order, cutoff_hz, fs=fs, output="sos")
+                            yu_filtered = sosfiltfilt(sos, yu)
+                            out[segment_slice] = np.interp(segment_times, tu, yu_filtered)
+                        except Exception:
+                            pass
+        start = None
+
+    return pd.Series(out, index=series.index, dtype="float64")
+
 
 def build_performance_over_time_figure(metrics: pd.DataFrame) -> go.Figure:
     # AGENT_NOTE: Expects metrics columns:
@@ -268,7 +373,7 @@ def build_degiro_costs_quarterly_figure(costs_df: pd.DataFrame) -> go.Figure:
         )
 
     line_quarterly = (
-        grouped.groupby("quarter", dropna=False, as_index=False)
+        grouped.groupby("quarter", dropna=False, as_index=False, observed=False)
         .agg(
             trade_count=("trade_count", "sum") if "trade_count" in grouped.columns else ("total_costs_eur", "size"),
             market_count=("market_count", "sum")
@@ -400,9 +505,12 @@ def build_portfolio_over_time_figure(metrics: pd.DataFrame) -> go.Figure:
 def build_normalized_median_figure(
     prices_eur: pd.DataFrame,
     *,
+    prices_local: pd.DataFrame | None = None,
     instruments: pd.DataFrame | None = None,
+    holdings_catalog: pd.DataFrame | None = None,
     lookback_months: int,
     median_window_months: int,
+    apply_lowpass_filter: bool = False,
 ) -> go.Figure:
     fig = go.Figure()
     if prices_eur.empty:
@@ -410,13 +518,19 @@ def build_normalized_median_figure(
         return fig
 
     end_date = prices_eur.index.max()
-    start_date = end_date - pd.DateOffset(months=lookback_months)
     window_days = max(5, int(round(median_window_months * 30.44)))
-    lookback = prices_eur.loc[prices_eur.index >= start_date]
+    lookback_value = int(lookback_months)
+    if lookback_value <= 0:
+        lookback = prices_eur
+        lookback_label = "all-time"
+    else:
+        start_date = end_date - pd.DateOffset(months=lookback_value)
+        lookback = prices_eur.loc[prices_eur.index >= start_date]
+        lookback_label = f"{lookback_value}m"
 
-    instrument_meta: dict[str, dict[str, str]] = {}
-    if instruments is not None and not instruments.empty and "instrument_id" in instruments.columns:
-        tmp = instruments.copy()
+    instrument_meta: dict[str, dict[str, object]] = {}
+    if holdings_catalog is not None and not holdings_catalog.empty and "instrument_id" in holdings_catalog.columns:
+        tmp = holdings_catalog.copy()
         tmp["instrument_id"] = tmp["instrument_id"].astype(str)
         for row in tmp.itertuples(index=False):
             instrument_id = str(getattr(row, "instrument_id", ""))
@@ -427,49 +541,329 @@ def build_normalized_median_figure(
             instrument_meta[instrument_id] = {
                 "ticker": ticker if ticker and ticker.lower() not in {"nan", "none"} else instrument_id,
                 "product": product if product and product.lower() not in {"nan", "none"} else instrument_id,
+                "currency": str(getattr(row, "currency", "EUR")).strip().upper() or "EUR",
+                "is_etf": bool(getattr(row, "is_etf", False)),
+                "over_target_eur": float(pd.to_numeric(getattr(row, "over_target_eur", np.nan), errors="coerce")),
+                "is_over_target_threshold": bool(getattr(row, "is_over_target_threshold", False)),
+                "target_status": str(getattr(row, "target_status", "")).strip(),
             }
+    if instruments is not None and not instruments.empty and "instrument_id" in instruments.columns:
+        tmp = instruments.copy()
+        tmp["instrument_id"] = tmp["instrument_id"].astype(str)
+        for row in tmp.itertuples(index=False):
+            instrument_id = str(getattr(row, "instrument_id", ""))
+            if instrument_id == "":
+                continue
+            ticker = str(getattr(row, "ticker", "")).strip()
+            product = str(getattr(row, "product", "")).strip()
+            merged = instrument_meta.get(instrument_id, {}).copy()
+            merged.setdefault(
+                "ticker",
+                ticker if ticker and ticker.lower() not in {"nan", "none"} else instrument_id,
+            )
+            merged.setdefault(
+                "product",
+                product if product and product.lower() not in {"nan", "none"} else instrument_id,
+            )
+            merged.setdefault("currency", str(getattr(row, "currency", "EUR")).strip().upper() or "EUR")
+            merged.setdefault("is_etf", bool(getattr(row, "is_etf", False)))
+            merged.setdefault("over_target_eur", float("nan"))
+            merged.setdefault("is_over_target_threshold", False)
+            merged.setdefault("target_status", "")
+            instrument_meta[instrument_id] = merged
 
+    trace_specs: list[dict[str, object]] = []
     for col in lookback.columns:
         series = lookback[col].astype(float)
         rolling_median = series.rolling(window=window_days, min_periods=max(5, window_days // 3)).median()
         normalized = series / rolling_median
+        full_series = pd.to_numeric(prices_eur[col], errors="coerce")
+        full_rolling_median = full_series.rolling(
+            window=window_days,
+            min_periods=max(5, window_days // 3),
+        ).median()
+        full_normalized = full_series / full_rolling_median
+        if apply_lowpass_filter:
+            normalized = _apply_lowpass_butterworth(normalized)
+            full_normalized = _apply_lowpass_butterworth(full_normalized)
         col_key = str(col)
-        meta = instrument_meta.get(col_key, {"ticker": col_key, "product": col_key})
-        ticker_label = meta["ticker"]
-        product_label = meta["product"]
+        meta = instrument_meta.get(
+            col_key,
+            {
+                "ticker": col_key,
+                "product": col_key,
+                "currency": "EUR",
+                "is_etf": False,
+                "over_target_eur": float("nan"),
+                "is_over_target_threshold": False,
+                "target_status": "",
+            },
+        )
+        ticker_label = str(meta["ticker"])
+        product_label = str(meta["product"])
+        currency_code = str(meta.get("currency", "EUR")).strip().upper() or "EUR"
+        is_etf = bool(meta.get("is_etf", False))
+        over_target_eur = float(pd.to_numeric(meta.get("over_target_eur", np.nan), errors="coerce"))
+        is_over_target_threshold = bool(meta.get("is_over_target_threshold", False))
+        target_status = str(meta.get("target_status", "")).strip()
+        if target_status == "":
+            if np.isfinite(over_target_eur) and over_target_eur > 0.0:
+                target_status = "Over target"
+            elif np.isfinite(over_target_eur) and over_target_eur < 0.0:
+                target_status = "Under target"
+            else:
+                target_status = "At target"
+        latest_price_series = full_series.dropna()
+        latest_normalized_series = full_normalized.dropna()
+        latest_price_eur = float(latest_price_series.iloc[-1]) if not latest_price_series.empty else np.nan
+        latest_price_date = (
+            pd.Timestamp(latest_price_series.index[-1]).strftime("%b %d, %Y")
+            if not latest_price_series.empty
+            else "N/A"
+        )
+        latest_normalized = (
+            float(latest_normalized_series.iloc[-1]) if not latest_normalized_series.empty else np.nan
+        )
+        local_series = None
+        latest_local_price = np.nan
+        if isinstance(prices_local, pd.DataFrame) and col in prices_local.columns:
+            local_series = pd.to_numeric(prices_local[col], errors="coerce").reindex(normalized.index)
+            latest_local_series = pd.to_numeric(prices_local[col], errors="coerce").dropna()
+            if not latest_local_series.empty:
+                latest_local_price = float(latest_local_series.iloc[-1])
+        customdata = np.column_stack(
+            [
+                np.full(len(normalized), product_label, dtype=object),
+                series.to_numpy(dtype=float, copy=False),
+                np.full(len(normalized), latest_price_eur, dtype=float),
+                np.full(len(normalized), latest_price_date, dtype=object),
+                np.full(len(normalized), latest_normalized, dtype=float),
+                np.full(len(normalized), "ETF" if is_etf else "Non-ETF", dtype=object),
+                np.full(len(normalized), target_status, dtype=object),
+                np.full(
+                    len(normalized),
+                    "Above threshold" if is_over_target_threshold else "At/below threshold",
+                    dtype=object,
+                ),
+                (
+                    local_series.to_numpy(dtype=float, copy=False)
+                    if isinstance(local_series, pd.Series)
+                    else np.full(len(normalized), np.nan, dtype=float)
+                ),
+                np.full(len(normalized), latest_local_price, dtype=float),
+                np.full(len(normalized), currency_code, dtype=object),
+            ]
+        )
+        line_width = (
+            3.0
+            if is_over_target_threshold
+            else (2.3 if np.isfinite(over_target_eur) and over_target_eur > 0.0 else 1.6)
+        )
+        line_opacity = (
+            1.0
+            if is_over_target_threshold
+            else (0.95 if np.isfinite(over_target_eur) and over_target_eur > 0.0 else 0.78)
+        )
+        trace_specs.append(
+            {
+                "instrument_id": col_key,
+                "ticker": ticker_label,
+                "currency_code": currency_code,
+                "is_etf": is_etf,
+                "legend_rank": 0 if is_etf else 1,
+                "x": normalized.index,
+                "y": normalized,
+                "customdata": customdata,
+                "line_width": line_width,
+                "line_opacity": line_opacity,
+            }
+        )
+
+    trace_specs.sort(key=lambda item: (int(item["legend_rank"]), str(item["ticker"]).upper()))
+    unique_types = {bool(spec["is_etf"]) for spec in trace_specs}
+    etf_color_idx = 0
+    non_etf_color_idx = 0
+    distinct_color_idx = 0
+    for spec in trace_specs:
+        is_etf = bool(spec["is_etf"])
+        currency_code = str(spec.get("currency_code", "EUR"))
+        if len(unique_types) == 1:
+            line_color = _distinct_normalized_color(distinct_color_idx)
+            distinct_color_idx += 1
+        else:
+            line_color = _normalized_group_color(
+                is_etf=is_etf,
+                group_index=etf_color_idx if is_etf else non_etf_color_idx,
+            )
+            if is_etf:
+                etf_color_idx += 1
+            else:
+                non_etf_color_idx += 1
+        local_price_hover = (
+            f"Price ({currency_code}): %{{customdata[8]:,.2f}}<br>"
+            if currency_code != "EUR"
+            else ""
+        )
+        latest_local_price_hover = (
+            f"Most recent price ({currency_code}): %{{customdata[9]:,.2f}}<br>"
+            if currency_code != "EUR"
+            else ""
+        )
+        hovertemplate = (
+            "Ticker: %{fullData.name}<br>"
+            "Product: %{customdata[0]}<br>"
+            "Price (EUR): %{customdata[1]:,.2f}<br>"
+            + local_price_hover
+            + "Normalized price: %{y:.4f}<br>"
+            + "Most recent price (EUR): %{customdata[2]:,.2f}<br>"
+            + latest_local_price_hover
+            + "Most recent price date: %{customdata[3]}<br>"
+            + "Most recent normalized price: %{customdata[4]:.4f}<br>"
+            + "Holding type: %{customdata[5]}<br>"
+            + "Target status: %{customdata[6]}<br>"
+            + "Threshold status: %{customdata[7]}<extra></extra>"
+        )
         fig.add_trace(
             go.Scatter(
-                x=normalized.index,
-                y=normalized,
+                x=spec["x"],
+                y=spec["y"],
                 mode="lines",
-                name=ticker_label,
-                customdata=np.full(len(normalized), product_label, dtype=object),
-                hovertemplate=(
-                    "Ticker: %{fullData.name}<br>"
-                    "Product: %{customdata}<br>"
-                    "Normalized: %{y:.4f}<extra></extra>"
+                name=str(spec["ticker"]),
+                uid=str(spec["instrument_id"]),
+                customdata=spec["customdata"],
+                line=dict(
+                    color=line_color,
+                    dash="solid",
+                    width=float(spec["line_width"]),
                 ),
+                opacity=float(spec["line_opacity"]),
+                hovertemplate=hovertemplate,
             )
         )
 
     fig.update_layout(
         template="plotly_white",
-        hovermode="x unified",
+        hovermode="closest",
+        uirevision="normalized-median-chart",
         title=(
             f"Stock Development Normalized to Rolling Median "
-            f"({median_window_months}m window, {lookback_months}m lookback)"
+            f"({median_window_months}m window, {lookback_label} lookback)"
+            f"{' | Butterworth smoothed' if apply_lowpass_filter else ''}"
         ),
         yaxis=dict(title="Normalized price"),
         legend=dict(
-            orientation="h",
+            orientation="v",
             yanchor="top",
-            y=-0.24,
-            xanchor="center",
-            x=0.5,
+            y=1.0,
+            xanchor="left",
+            x=1.02,
+            itemclick="toggle",
+            itemdoubleclick="toggleothers",
         ),
-        margin=dict(l=10, r=10, t=50, b=110),
+        margin=dict(l=10, r=240, t=50, b=40),
     )
     return fig
+
+
+def build_normalized_median_window_switcher_figure(
+    figures_by_window: dict[int, go.Figure],
+    *,
+    default_window_months: int | None = None,
+) -> go.Figure:
+    valid_figures = {
+        int(window_months): figure
+        for window_months, figure in figures_by_window.items()
+        if isinstance(figure, go.Figure)
+    }
+    if not valid_figures:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", title="No normalized price series available")
+        return fig
+
+    available_windows = sorted(valid_figures)
+    default_window = (
+        int(default_window_months)
+        if default_window_months is not None and int(default_window_months) in valid_figures
+        else available_windows[0]
+    )
+    base_figure = valid_figures[default_window]
+    combined = go.Figure()
+    titles_by_window: dict[int, str] = {}
+    window_trace_indexes: dict[int, list[int]] = {}
+
+    for window_months in available_windows:
+        current_figure = valid_figures[window_months]
+        titles_by_window[window_months] = str(
+            current_figure.layout.title.text
+            if current_figure.layout.title.text is not None
+            else f"Stock Development Normalized to Rolling Median ({window_months}m window)"
+        )
+        window_trace_indexes[window_months] = []
+        for trace in current_figure.data:
+            payload = trace.to_plotly_json()
+            payload["visible"] = window_months == default_window
+            uid = payload.get("uid")
+            if uid is not None:
+                payload["uid"] = f"{uid}__{window_months}m"
+            combined.add_trace(go.Scatter(**payload))
+            window_trace_indexes[window_months].append(len(combined.data) - 1)
+
+    base_layout = base_figure.layout.to_plotly_json()
+    base_layout.pop("updatemenus", None)
+    base_layout.pop("template", None)
+    combined.update_layout(template="plotly_white", **base_layout)
+    base_margin = dict(base_layout.get("margin", {}))
+    base_margin["t"] = max(int(base_margin.get("t", 0) or 0), 120)
+    title_layout = {
+        "x": 0.01,
+        "xanchor": "left",
+        "y": 0.98,
+        "yanchor": "top",
+    }
+    combined.update_layout(
+        title={"text": titles_by_window[default_window], **title_layout},
+        margin=base_margin,
+    )
+
+    if len(available_windows) > 1:
+        total_traces = len(combined.data)
+        buttons: list[dict[str, object]] = []
+        for window_months in available_windows:
+            visible = [False] * total_traces
+            for idx in window_trace_indexes[window_months]:
+                visible[idx] = True
+            buttons.append(
+                {
+                    "label": (
+                        f"{window_months} months"
+                        if window_months in {3, 6, 12}
+                        else f"Custom ({window_months} months)"
+                    ),
+                    "method": "update",
+                    "args": [
+                        {"visible": visible},
+                        {"title": {"text": titles_by_window[window_months], **title_layout}},
+                    ],
+                }
+            )
+        combined.update_layout(
+            updatemenus=[
+                {
+                    "type": "buttons",
+                    "direction": "right",
+                    "showactive": True,
+                    "active": available_windows.index(default_window),
+                    "buttons": buttons,
+                    "x": 1.0,
+                    "xanchor": "right",
+                    "y": 1.20,
+                    "yanchor": "top",
+                    "pad": {"r": 8, "t": 0},
+                }
+            ]
+        )
+
+    return combined
 
 
 def format_latest_totals_text(
@@ -684,7 +1078,7 @@ def build_holdings_segment_pie_figure(
     holdings_df: pd.DataFrame,
     title: str,
     total_portfolio_value_eur: float | None = None,
-    target_total_pct: float | None = None,
+    target_per_holding_pct: float | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if holdings_df is None or holdings_df.empty or "value_eur" not in holdings_df.columns:
@@ -798,14 +1192,21 @@ def build_holdings_segment_pie_figure(
         margin=dict(l=10, r=10, t=50, b=20),
         legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
     )
-    target_value = pd.to_numeric(target_total_pct, errors="coerce")
+    target_value = pd.to_numeric(target_per_holding_pct, errors="coerce")
+    if not np.isfinite(target_value) and "target_per_holding_pct" in data.columns:
+        target_series = pd.to_numeric(data["target_per_holding_pct"], errors="coerce")
+        positive_targets = target_series[target_series > 0.0]
+        if not positive_targets.empty:
+            target_value = float(positive_targets.max())
+        elif target_series.notna().any():
+            target_value = float(target_series.fillna(0.0).max())
     if np.isfinite(target_value):
         fig.add_annotation(
             x=0.5,
             y=0.5,
             xref="paper",
             yref="paper",
-            text=f"Target: {float(target_value):.1f}%",
+            text=f"Target:<br>{float(target_value):.1f}%",
             showarrow=False,
             font=dict(size=14, color="#4b5563"),
             align="center",

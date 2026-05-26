@@ -1,13 +1,13 @@
 {
   "data_sources": {
+    "classification_path": "ticker_classification_complete.csv",
     "dataset_a_dir": "data\\pensioenbeleggen",
-    "dataset_b_dir": "data\\spaarbeleggen",
-    "classification_path": "ticker_classification_complete.csv"
+    "dataset_b_dir": "data\\spaarbeleggen"
   },
-  "saved_at": "2026-02-23T21:08:42",
+  "saved_at": "2026-05-20T08:56:09",
   "strategy": {
     "desired_etf_holdings": 4,
-    "desired_non_etf_holdings": 12,
+    "desired_non_etf_holdings": 11,
     "max_pair_correlation": 0.9,
     "max_single_currency_pct": 65.0,
     "max_single_holding_pct": 12.0,
@@ -15,14 +15,14 @@
     "max_top5_holdings_pct": 55.0,
     "min_over_value_eur": 400.0,
     "min_total_holdings": 12,
-    "target_cash_pct": 10.0,
+    "target_cash_pct": 5.0,
     "target_currency_pct": {
       "EUR": 50.0,
       "USD": 50.0
     },
-    "target_etf_pct": 45.0,
-    "target_non_etf_pct": 45.0,
+    "target_etf_pct": 47.5,
     "target_industry_pct": {},
+    "target_non_etf_pct": 47.5,
     "target_style_pct": {
       "Dividend": 33.0,
       "Growth": 34.0,

@@ -56,7 +56,7 @@ BASE_YELLOW = "#F4C300"
 BASE_GREEN = "#009F3D"
 
 # Defaults.
-DEFAULT_LOOKBACK_MONTHS = 24
+DEFAULT_LOOKBACK_MONTHS = 0
 DEFAULT_MEDIAN_WINDOW_MONTHS = 6
 # Legacy invested-sleeve split default used for backward-compatible strategy loading.
 DEFAULT_TARGET_ETF_FRACTION = 0.50

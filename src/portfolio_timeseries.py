@@ -47,6 +47,7 @@ class TimeSeriesResult:
     metrics: pd.DataFrame
     positions: pd.DataFrame
     prices_eur: pd.DataFrame
+    prices_local: pd.DataFrame
     latest_price_data_date: pd.Timestamp | None
     fill_stats: pd.DataFrame
     warnings: list[str]
@@ -168,16 +169,23 @@ def compute_portfolio_timeseries(
             "Load at least one dataset with Transactions.csv before running analysis.",
         )
 
-    start_date = transactions["datetime"].dropna().min().normalize()
-    if pd.isna(start_date):
+    tx_dates = pd.to_datetime(transactions["datetime"], errors="coerce").dropna()
+    account_dates = (
+        pd.to_datetime(account["datetime"], errors="coerce").dropna()
+        if not account.empty and "datetime" in account.columns
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    start_candidates = [ts.normalize() for ts in [tx_dates.min(), account_dates.min()] if pd.notna(ts)]
+    if not start_candidates:
         raise UserFacingError(
             "Transactions contain no valid datetime values.",
             "Verify the Date and Time columns in Transactions.csv.",
         )
+    start_date = min(start_candidates)
 
     end_date = max(
-        transactions["datetime"].dropna().max().normalize(),
-        account["datetime"].dropna().max().normalize() if not account.empty else start_date,
+        tx_dates.max().normalize(),
+        account_dates.max().normalize() if not account_dates.empty else start_date,
     )
     if end_date_override is not None:
         override_ts = pd.to_datetime(end_date_override, errors="coerce")
@@ -190,7 +198,7 @@ def compute_portfolio_timeseries(
         instruments=instruments,
         daily_index=daily_index,
     )
-    prices_eur, fill_stats, price_warnings, price_issues, latest_price_data_date = build_daily_prices_eur(
+    prices_eur, prices_local, fill_stats, price_warnings, price_issues, latest_price_data_date = build_daily_prices_eur(
         instruments=instruments,
         daily_index=daily_index,
         cache_dir=cache_dir,
@@ -208,6 +216,7 @@ def compute_portfolio_timeseries(
 
     positions = positions[shared_cols]
     prices_eur = prices_eur[shared_cols]
+    prices_local = prices_local[shared_cols]
     positions_value = (positions * prices_eur).sum(axis=1).rename("positions_value")
 
     cash_from_statement, cash_warnings, cash_issues = build_daily_cash_series(
@@ -266,6 +275,7 @@ def compute_portfolio_timeseries(
         trim_end_date = pd.Timestamp(normalized_latest_price_date).normalize()
         positions = positions.loc[:trim_end_date].copy()
         prices_eur = prices_eur.loc[:trim_end_date].copy()
+        prices_local = prices_local.loc[:trim_end_date].copy()
         metrics = metrics.loc[:trim_end_date].copy()
 
     cash_gap = (cash_from_statement - cash_from_changes).abs()
@@ -318,6 +328,7 @@ def compute_portfolio_timeseries(
         metrics=metrics,
         positions=positions,
         prices_eur=prices_eur,
+        prices_local=prices_local,
         latest_price_data_date=(
             pd.Timestamp(normalized_latest_price_date).normalize()
             if pd.notna(normalized_latest_price_date)
@@ -363,16 +374,17 @@ def build_daily_prices_eur(
     daily_index: pd.DatetimeIndex,
     cache_dir: str,
     logger: logging.Logger | None,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[dict[str, object]], pd.Timestamp | None]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[dict[str, object]], pd.Timestamp | None]:
     warnings: list[str] = []
     issues: list[dict[str, object]] = []
     prices: dict[str, pd.Series] = {}
+    prices_local: dict[str, pd.Series] = {}
     fill_rows: list[dict[str, object]] = []
     latest_price_data_date: pd.Timestamp | None = None
 
     non_cash = instruments[~instruments["is_cash_like"].fillna(False)].copy()
     if non_cash.empty:
-        return pd.DataFrame(index=daily_index), pd.DataFrame(), warnings, issues, None
+        return pd.DataFrame(index=daily_index), pd.DataFrame(index=daily_index), pd.DataFrame(), warnings, issues, None
 
     start, end = daily_index.min(), daily_index.max()
     for row in non_cash.itertuples(index=False):
@@ -417,6 +429,7 @@ def build_daily_prices_eur(
 
         local = local.reindex(daily_index)
         original_missing = int(local.isna().sum())
+        local_filled = local.ffill().bfill()
 
         if currency != "EUR":
             try:
@@ -453,6 +466,7 @@ def build_daily_prices_eur(
             )
 
         prices[str(row.instrument_id)] = filled
+        prices_local[str(row.instrument_id)] = local_filled
         fill_rows.append(
             {
                 "instrument_id": row.instrument_id,
@@ -474,6 +488,7 @@ def build_daily_prices_eur(
 
     return (
         pd.DataFrame(prices, index=daily_index),
+        pd.DataFrame(prices_local, index=daily_index),
         pd.DataFrame(fill_rows),
         warnings,
         issues,

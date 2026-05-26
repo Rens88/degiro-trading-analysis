@@ -97,15 +97,28 @@ def build_latest_valued_holdings(
     *,
     positions: pd.DataFrame | None = None,
     prices_eur: pd.DataFrame | None = None,
+    instruments: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if holdings is None or holdings.empty:
-        return pd.DataFrame()
-
-    aggregated = aggregate_holdings(holdings)
-    if aggregated.empty:
-        return aggregated
+        aggregated = pd.DataFrame(
+            columns=[
+                "instrument_id",
+                "product",
+                "isin",
+                "ticker",
+                "is_etf",
+                "account_label",
+                "currency",
+                "quantity",
+                "value_eur",
+            ]
+        )
+    else:
+        aggregated = aggregate_holdings(holdings)
 
     out = aggregated.copy()
+    if "instrument_id" not in out.columns:
+        out["instrument_id"] = pd.Series(dtype="object")
     raw_qty = pd.to_numeric(out.get("quantity"), errors="coerce").abs()
     raw_value_abs = pd.to_numeric(out.get("value_eur"), errors="coerce").abs()
     fallback_px = np.where(raw_qty > 1e-12, raw_value_abs / raw_qty, np.nan)
@@ -127,6 +140,49 @@ def build_latest_valued_holdings(
             for idx, val in latest_prices.items()
             if pd.notna(val) and np.isfinite(float(val))
         }
+
+    existing_ids = set(out["instrument_id"].astype(str))
+    missing_ids = [
+        iid for iid, qty in latest_qty_map.items() if abs(float(qty)) > 1e-12 and iid not in existing_ids
+    ]
+    if missing_ids:
+        instrument_lookup = pd.DataFrame()
+        if isinstance(instruments, pd.DataFrame) and not instruments.empty and "instrument_id" in instruments.columns:
+            instrument_lookup = instruments.drop_duplicates(subset=["instrument_id"], keep="first").copy()
+
+        rows_to_add: list[dict[str, Any]] = []
+        for instrument_id in missing_ids:
+            base_row: dict[str, Any] = {
+                "instrument_id": instrument_id,
+                "product": instrument_id,
+                "isin": instrument_id,
+                "ticker": "",
+                "is_etf": False,
+                "account_label": "",
+                "currency": "",
+                "quantity": np.nan,
+                "value_eur": np.nan,
+            }
+            if not instrument_lookup.empty:
+                match = instrument_lookup.loc[instrument_lookup["instrument_id"].astype(str).eq(str(instrument_id))]
+                if not match.empty:
+                    row = match.iloc[0]
+                    base_row["product"] = row.get("product", instrument_id)
+                    base_row["isin"] = row.get("isin", instrument_id)
+                    base_row["ticker"] = row.get("ticker", "")
+                    base_row["currency"] = row.get("currency", "")
+                    base_row["account_label"] = row.get("account_label", "")
+                    is_etf = row.get("is_etf", False)
+                    base_row["is_etf"] = bool(False if pd.isna(is_etf) else is_etf)
+            rows_to_add.append(base_row)
+
+        out = pd.concat([out, pd.DataFrame(rows_to_add)], ignore_index=True)
+        raw_qty = pd.to_numeric(out.get("quantity"), errors="coerce").abs()
+        raw_value_abs = pd.to_numeric(out.get("value_eur"), errors="coerce").abs()
+        fallback_px = np.where(raw_qty > 1e-12, raw_value_abs / raw_qty, np.nan)
+
+    if out.empty:
+        return out
 
     out["quantity"] = out["instrument_id"].map(lambda iid: latest_qty_map.get(str(iid), np.nan))
     out["quantity"] = out["quantity"].where(out["quantity"].notna(), raw_qty).abs()
@@ -319,6 +375,7 @@ def aggregate_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
 
     grouped = df.groupby(group_cols, dropna=False, as_index=False).agg(
         account_label=("account_label", _join_unique_non_empty),
+        currency=("currency", _join_unique_non_empty),
         quantity=("quantity", "sum"),
         value_eur=("value_eur", "sum"),
     )

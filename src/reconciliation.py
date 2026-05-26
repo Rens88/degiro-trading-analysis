@@ -94,14 +94,14 @@ def cash_row_mask(portfolio: pd.DataFrame) -> pd.Series:
     product = portfolio["product"].fillna("").astype(str).str.upper()
     isin = portfolio["isin"].fillna("").astype(str).str.upper()
     by_product = product.str.contains(
-        r"(CASH|CASH SWEEP|CASH FUND|MONEY MARKET|GELDREKENING|BANKACCOUNT|FLATEX)",
+        r"(?:CASH|CASH SWEEP|CASH FUND|MONEY MARKET|GELDREKENING|BANKACCOUNT|FLATEX)",
         regex=True,
     )
     by_known_cash_isin = isin.isin({"NLFLATEXACNT"})
     missing_isin = isin.eq("")
-    currency_only = product.str.fullmatch(r"(EUR|USD|GBP|CHF|JPY|AUD|CAD)(\s+CASH)?", na=False)
+    currency_only = product.str.fullmatch(r"(?:EUR|USD|GBP|CHF|JPY|AUD|CAD)(?:\s+CASH)?", na=False)
     missing_isin_cash_like = missing_isin & (
-        product.str.contains(r"(CASH|GELD|MONEY MARKET)", regex=True) | currency_only
+        product.str.contains(r"(?:CASH|GELD|MONEY MARKET)", regex=True) | currency_only
     )
     return by_product | by_known_cash_isin | missing_isin_cash_like
 

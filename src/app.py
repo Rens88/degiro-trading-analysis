@@ -20,6 +20,7 @@ When editing:
 from __future__ import annotations
 
 import html
+import importlib.util
 import json
 import os
 import time
@@ -78,6 +79,7 @@ from .plots import (
     build_performance_over_time_figure,
     build_period_decomposition_figure,
     build_normalized_median_figure,
+    build_normalized_median_window_switcher_figure,
     build_portfolio_over_time_figure,
 )
 from .portfolio_timeseries import (
@@ -97,6 +99,7 @@ from .reconciliation import (
     reconciliation_table,
 )
 from .tables import (
+    apply_ranked_target_per_holding_pct,
     build_four_tables,
     build_latest_valued_holdings,
     build_monthly_starting_portfolio_value_table,
@@ -178,6 +181,7 @@ def ensure_session_state() -> None:
             "processed": {},
             "summaries": {},
             "warnings": [],
+            "import_integrity_warnings": [],
             "nav": {},
         },
     )
@@ -187,6 +191,7 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("processed_sig", None)
     st.session_state.setdefault("export_bytes", None)
     st.session_state["workflow"].setdefault("reported_values", {})
+    st.session_state["workflow"].setdefault("import_integrity_warnings", [])
     st.session_state.setdefault("dataset_a_reported_cash_text", "2.24   ")
     st.session_state.setdefault("dataset_a_reported_total_text", "39889.00")
     st.session_state.setdefault("dataset_b_reported_cash_text", "19.40")
@@ -475,6 +480,7 @@ def _autoload_dataset_from_folder(
             account_path.stat().st_size,
         ),
     }
+    _refresh_import_integrity_warnings()
     log(f"Startup auto-loaded {panel_title} from {folder}", start, logger)
     return True
 
@@ -617,14 +623,15 @@ def render_sidebar(*, logger: Any) -> None:
     st.sidebar.header("Analysis Parameters")
     lookback_months = st.sidebar.number_input(
         "lookback_months",
-        min_value=1,
+        min_value=0,
         max_value=240,
         value=DEFAULT_LOOKBACK_MONTHS,
         step=1,
         disabled=not at_or_after(STATE_SELECTING_PARAMS),
         help=(
-            "How many months of historical data are included in returns, charts, "
-            "and diagnostics."
+            "How many months of historical price data are included in the "
+            "normalized-price chart. Set to 0 for all-time. Lower positive "
+            "values can improve speed."
         ),
     )
     median_window_months = st.sidebar.number_input(
@@ -635,8 +642,9 @@ def render_sidebar(*, logger: Any) -> None:
         step=1,
         disabled=not at_or_after(STATE_SELECTING_PARAMS),
         help=(
-            "Rolling median window (months) used in normalized-price and "
-            "deviation views."
+            "Custom rolling median window (months) for the normalized-price "
+            "chart. The Outlook section also includes quick tabs for 3, 6, "
+            "and 12 months."
         ),
     )
     st.sidebar.header("Spread Strategy")
@@ -998,6 +1006,7 @@ def render_dataset_panel(
             if panel_key in st.session_state["workflow"]["datasets"]:
                 del st.session_state["workflow"]["datasets"][panel_key]
                 changed = True
+            _refresh_import_integrity_warnings()
             st.session_state[panel_expanded_key] = True
 
         if load_clicked:
@@ -1043,6 +1052,7 @@ def render_dataset_panel(
                     "source_sig": source_sig,
                 }
                 changed = True
+                _refresh_import_integrity_warnings()
                 st.session_state[panel_expanded_key] = False
                 log(f"Loaded {panel_title}", start, logger)
                 st.success(f"{panel_title} loaded.")
@@ -1270,6 +1280,85 @@ def build_daily_position_cost_basis(
     return pd.DataFrame(rows, index=daily_index, columns=instrument_ids, dtype="float64")
 
 
+def _frame_fingerprint(df: pd.DataFrame, *, sort_cols: list[str]) -> str:
+    if df is None or df.empty:
+        return ""
+    cols = [col for col in sort_cols if col in df.columns]
+    out = df.loc[:, cols].copy() if cols else df.copy()
+    if cols:
+        out = out.sort_values(cols, kind="stable", na_position="last")
+    out = out.reset_index(drop=True)
+    return out.to_json(orient="split", date_format="iso", date_unit="s")
+
+
+def _dataset_integrity_warnings(datasets: dict[str, LoadedDataset]) -> list[str]:
+    dataset_items = list(datasets.items())
+    if len(dataset_items) < 2:
+        return []
+
+    tx_fingerprint = {
+        key: _frame_fingerprint(
+            dataset.transactions,
+            sort_cols=["datetime", "instrument_id", "quantity", "total_eur", "account_label"],
+        )
+        for key, dataset in dataset_items
+    }
+    account_fingerprint = {
+        key: _frame_fingerprint(
+            dataset.account,
+            sort_cols=["datetime", "description", "currency", "raw_change", "raw_balance", "account_label"],
+        )
+        for key, dataset in dataset_items
+    }
+    portfolio_fingerprint = {
+        key: _frame_fingerprint(
+            dataset.portfolio,
+            sort_cols=["instrument_id", "product", "quantity", "value_eur", "account_label"],
+        )
+        for key, dataset in dataset_items
+    }
+
+    warnings: list[str] = []
+    for idx, (left_key, left_dataset) in enumerate(dataset_items):
+        for right_key, right_dataset in dataset_items[idx + 1 :]:
+            transactions_match = tx_fingerprint[left_key] == tx_fingerprint[right_key]
+            if (
+                account_fingerprint[left_key] != ""
+                and account_fingerprint[left_key] == account_fingerprint[right_key]
+                and not transactions_match
+            ):
+                warnings.append(
+                    "Datasets "
+                    f"`{left_dataset.account_label}` and `{right_dataset.account_label}` have identical "
+                    "`Account.csv` content but different transactions. Deposit and cash history will be wrong "
+                    "until the account export is replaced."
+                )
+            if (
+                portfolio_fingerprint[left_key] != ""
+                and portfolio_fingerprint[left_key] == portfolio_fingerprint[right_key]
+                and not transactions_match
+            ):
+                warnings.append(
+                    "Datasets "
+                    f"`{left_dataset.account_label}` and `{right_dataset.account_label}` have identical "
+                    "`Portfolio.csv` content but different transactions. Snapshot-based holdings views may be wrong "
+                    "until the portfolio export is replaced."
+                )
+    return warnings
+
+
+def _refresh_import_integrity_warnings() -> None:
+    workflow = st.session_state.get("workflow", {})
+    dataset_entries = workflow.get("datasets", {}) if isinstance(workflow, dict) else {}
+    loaded_datasets: dict[str, LoadedDataset] = {}
+    for key, value in dataset_entries.items():
+        dataset = value.get("dataset") if isinstance(value, dict) else None
+        if isinstance(dataset, LoadedDataset):
+            loaded_datasets[key] = dataset
+    if isinstance(workflow, dict):
+        workflow["import_integrity_warnings"] = _dataset_integrity_warnings(loaded_datasets)
+
+
 def run_analysis(*, params: dict[str, Any], logger: Any) -> None:
     workflow = st.session_state["workflow"]
     datasets_entries = workflow["datasets"]
@@ -1331,6 +1420,7 @@ def process_loaded_datasets(
     source_date_ranges: dict[str, dict[str, pd.Timestamp]] = {}
     issue_tables: list[dict[str, Any]] = []
     analysis_end_date = pd.Timestamp.today().normalize()
+    integrity_warnings = _dataset_integrity_warnings(datasets)
 
     for key, dataset in datasets.items():
         cash_result, totals_result = reconcile_dataset(
@@ -1420,6 +1510,14 @@ def process_loaded_datasets(
         holdings_for_tables_raw,
         positions=ts_result.positions,
         prices_eur=ts_result.prices_eur,
+        instruments=merged_instruments,
+    )
+    normalized_holdings_catalog = apply_ranked_target_per_holding_pct(
+        holdings_for_tables,
+        target_etf_pct=float(params["target_etf_pct"]),
+        target_non_etf_pct=float(params["target_non_etf_pct"]),
+        desired_etf_holdings=int(params["desired_etf_holdings"]),
+        desired_non_etf_holdings=int(params["desired_non_etf_holdings"]),
     )
     latest_metrics = ts_result.metrics.iloc[-1] if isinstance(ts_result.metrics, pd.DataFrame) and not ts_result.metrics.empty else pd.Series(dtype="float64")
     rebuilt_cash_value = _to_float_or_default(latest_metrics.get("cash"), float(combined_totals_sum.cash_value_eur))
@@ -1435,6 +1533,43 @@ def process_loaded_datasets(
         cash_source="rebuilt_latest_prices",
         total_value_eur=rebuilt_total_value,
     )
+    normalized_holdings_catalog["target_value_eur"] = (
+        pd.to_numeric(normalized_holdings_catalog["target_per_holding_pct"], errors="coerce").fillna(0.0)
+        / 100.0
+        * float(rebuilt_total_value)
+    )
+    normalized_holdings_catalog["over_target_eur"] = (
+        pd.to_numeric(normalized_holdings_catalog["value_eur"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(normalized_holdings_catalog["target_value_eur"], errors="coerce").fillna(0.0)
+    )
+    normalized_holdings_catalog["is_over_target_threshold"] = (
+        pd.to_numeric(normalized_holdings_catalog["over_target_eur"], errors="coerce").fillna(0.0)
+        > float(params["min_over_value_eur"])
+    )
+    normalized_holdings_catalog["target_status"] = np.where(
+        pd.to_numeric(normalized_holdings_catalog["over_target_eur"], errors="coerce").fillna(0.0) > 1e-9,
+        "Over target",
+        np.where(
+            pd.to_numeric(normalized_holdings_catalog["over_target_eur"], errors="coerce").fillna(0.0) < -1e-9,
+            "Under target",
+            "At target",
+        ),
+    )
+    normalized_holdings_catalog["threshold_status"] = np.where(
+        normalized_holdings_catalog["is_over_target_threshold"].fillna(False).astype(bool),
+        "Above threshold",
+        "At/below threshold",
+    )
+    normalized_holdings_catalog["holding_type"] = np.where(
+        normalized_holdings_catalog["is_etf"].fillna(False).astype(bool),
+        "ETF",
+        "Non-ETF",
+    )
+    normalized_holdings_catalog = normalized_holdings_catalog.sort_values(
+        ["is_etf", "value_eur", "ticker"],
+        ascending=[False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
     table_outputs = build_four_tables(
         holdings=holdings_for_tables,
         totals=table_totals,
@@ -1514,11 +1649,26 @@ def process_loaded_datasets(
         cost_basis_eur=holdings_cost_basis_df,
     )
     fig_benchmark = build_benchmark_comparison_figure(benchmark_bundle.get("levels_df", pd.DataFrame()))
-    fig_normalized = build_normalized_median_figure(
-        ts_result.prices_eur,
-        instruments=merged_instruments,
-        lookback_months=int(params["lookback_months"]),
-        median_window_months=int(params["median_window_months"]),
+    selected_normalized_window_months = int(params["median_window_months"])
+    normalized_window_months = [3, 6, 12]
+    if selected_normalized_window_months not in normalized_window_months:
+        normalized_window_months.append(selected_normalized_window_months)
+    normalized_window_months = sorted(set(normalized_window_months))
+    normalized_figures = {
+        window_months: build_normalized_median_figure(
+            ts_result.prices_eur,
+            prices_local=ts_result.prices_local,
+            instruments=merged_instruments,
+            holdings_catalog=normalized_holdings_catalog,
+            lookback_months=int(params["lookback_months"]),
+            median_window_months=int(window_months),
+        )
+        for window_months in normalized_window_months
+    }
+    fig_normalized = normalized_figures[selected_normalized_window_months]
+    fig_normalized_multi_window = build_normalized_median_window_switcher_figure(
+        normalized_figures,
+        default_window_months=selected_normalized_window_months,
     )
 
     warnings: list[str] = []
@@ -1656,6 +1806,12 @@ def process_loaded_datasets(
         "fig_benchmark": fig_benchmark,
         "fig_degiro_costs_quarterly": fig_degiro_costs_quarterly,
         "fig_normalized": fig_normalized,
+        "fig_normalized_multi_window": fig_normalized_multi_window,
+        "normalized_figures": normalized_figures,
+        "normalized_holdings_catalog": normalized_holdings_catalog,
+        "normalized_lookback_months": int(params["lookback_months"]),
+        "normalized_window_months": normalized_window_months,
+        "selected_normalized_window_months": selected_normalized_window_months,
         "tables": table_outputs,
         "ai_insights": ai_insights,
         "spread_analysis": spread_analysis,
@@ -1670,6 +1826,7 @@ def process_loaded_datasets(
         },
         "offline_mode": bool(cache_runtime_state.get("offline_mode", False)),
         "offline_cached_from": cache_runtime_state.get("offline_cached_from"),
+        "integrity_warnings": integrity_warnings,
         "warnings": warnings,
         "issue_tables": issue_tables,
     }
@@ -1829,7 +1986,17 @@ def render_main(*, logger: Any) -> None:
     # all section rendering and related tests.
     del logger
     workflow = st.session_state["workflow"]
+    _refresh_import_integrity_warnings()
     processed = workflow.get("processed", {})
+    import_integrity_warnings = workflow.get("import_integrity_warnings", [])
+    if not import_integrity_warnings and isinstance(processed, dict):
+        import_integrity_warnings = processed.get("integrity_warnings", [])
+    if import_integrity_warnings:
+        st.error(
+            "Import safety check:\n"
+            + "\n".join(f"- {warning}" for warning in import_integrity_warnings)
+            + "\nPlease verify that the correct files were imported for each dataset."
+        )
     if not processed or not at_or_after(STATE_VIEWING_RESULTS):
         st.info("Load Dataset A and/or Dataset B in the sidebar, then click Run analysis.")
         return
@@ -1930,6 +2097,15 @@ def render_main(*, logger: Any) -> None:
                 color: #E1011A;
                 opacity: 1;
             }
+            .overview-kpi-link {
+                display: block;
+                color: inherit;
+                text-decoration: none;
+            }
+            .overview-kpi-link:hover .overview-kpi-card {
+                border-color: rgba(1, 55, 138, 0.45);
+                box-shadow: 0 8px 18px rgba(1, 55, 138, 0.10);
+            }
             .overview-kpi-tooltip-box {
                 position: absolute;
                 left: 50%;
@@ -1954,6 +2130,12 @@ def render_main(*, logger: Any) -> None:
                 opacity: 1;
                 visibility: visible;
             }
+            .section-anchor {
+                display: block;
+                position: relative;
+                top: -0.5rem;
+                visibility: hidden;
+            }
             </style>
             """,
             unsafe_allow_html=True,
@@ -1965,19 +2147,26 @@ def render_main(*, logger: Any) -> None:
         value: str,
         tooltip: str,
         alert: bool = False,
+        href: str | None = None,
     ) -> None:
         variant_class = " overview-kpi-card--alert" if alert else ""
         safe_title = html.escape(str(title))
         safe_value = html.escape(str(value))
         safe_value = safe_value.replace("\n", "<br>")
         safe_tooltip = html.escape(str(tooltip)).replace("\n", "<br>")
+        card_html = (
+            f'<div class="overview-kpi-card{variant_class}">'
+            f'<div class="overview-kpi-label">{safe_title}</div>'
+            f'<div class="overview-kpi-value">{safe_value}</div>'
+            "</div>"
+        )
+        if href:
+            safe_href = html.escape(str(href), quote=True)
+            card_html = f'<a class="overview-kpi-link" href="{safe_href}">{card_html}</a>'
         st.markdown(
             (
                 '<div class="overview-kpi-tooltip">'
-                f'<div class="overview-kpi-card{variant_class}">'
-                f'<div class="overview-kpi-label">{safe_title}</div>'
-                f'<div class="overview-kpi-value">{safe_value}</div>'
-                "</div>"
+                f"{card_html}"
                 f'<div class="overview-kpi-tooltip-box">{safe_tooltip}</div>'
                 "</div>"
             ),
@@ -2378,6 +2567,7 @@ def render_main(*, logger: Any) -> None:
                     ],
                 ),
                 alert=over_threshold_total > 0,
+                href="#section-5-outlook-simple",
             )
         with c6:
             _render_overview_kpi_card(
@@ -2389,9 +2579,9 @@ def render_main(*, logger: Any) -> None:
                 tooltip=_card_tooltip(
                     "Savings-equivalent interest",
                     [
-                        "All-time investment P/L from the performance dashboard, with XIRR shown as an annualized return.",
-                        "This is flow-aware and therefore not identical to raw current value minus total net deposited when the analysis starts with an existing portfolio base.",
-                        f"Precise investment P/L: {_fmt_eur_symbol(savings_interest_equivalent_eur, decimals=2)}",
+                        "All-time profit amount, equal to current total value minus total net deposited.",
+                        "The yearly percentage shown below it is still the all-time XIRR, used as an annualized savings-equivalent return.",
+                        f"Precise all-time profit: {_fmt_eur_symbol(savings_interest_equivalent_eur, decimals=2)}",
                         f"Precise XIRR: {_fmt_pct_spaced(savings_xirr_pct)}/yr",
                     ],
                 ),
@@ -2423,7 +2613,19 @@ def render_main(*, logger: Any) -> None:
             else:
                 render_dataframe(recent_sells_df, width="stretch")
 
-    with st.expander("Section 2: Data Inconsistency", expanded=bool(product_name_inconsistencies)):
+    product_name_inconsistency_count = len(product_name_inconsistencies)
+    product_name_inconsistency_label = (
+        ""
+        if product_name_inconsistency_count <= 0
+        else (
+            f" :red[{product_name_inconsistency_count} "
+            f"{'inconsistency' if product_name_inconsistency_count == 1 else 'inconsistencies'} encountered!]"
+        )
+    )
+    with st.expander(
+        f"Section 2: Data Inconsistency{product_name_inconsistency_label}",
+        expanded=bool(product_name_inconsistencies),
+    ):
         if product_name_inconsistencies:
             st.error("Potentially consequential fix applied. Review the overridden product names below.")
             st.write(
@@ -2451,7 +2653,7 @@ def render_main(*, logger: Any) -> None:
                 "product, or should they indeed be considered as different products?"
             )
         else:
-            st.write("No inconsitencies detected")
+            st.write("No inconsistencies detected")
 
     validation_title = (
         "Section 3: Validation "
@@ -2609,9 +2811,322 @@ def render_main(*, logger: Any) -> None:
         )
         plotly_chart_stretch(processed.get("fig_degiro_costs_quarterly"))
 
+    st.markdown('<div id="section-5-outlook-simple" class="section-anchor"></div>', unsafe_allow_html=True)
     with st.expander("Section 5: Outlook (simple)", expanded=True):
         st.subheader("Stock Development Normalized to Rolling Median (Plotly)")
-        plotly_chart_stretch(processed.get("fig_normalized"))
+        st.caption(
+            "Select holdings first, then generate the normalized plots. "
+            "Window switching now happens inside the Plotly chart, so changing between prepared windows does not rerun Streamlit. "
+            "`lookback_months` still controls how much price history is shown."
+        )
+        normalized_figures = processed.get("normalized_figures", {})
+        normalized_multi_window_figure = processed.get("fig_normalized_multi_window")
+        normalized_holdings_catalog = processed.get("normalized_holdings_catalog", pd.DataFrame())
+        normalized_lookback_months = int(processed.get("normalized_lookback_months", DEFAULT_LOOKBACK_MONTHS))
+        normalized_window_months = processed.get("normalized_window_months", [])
+        selected_normalized_window_months = processed.get("selected_normalized_window_months")
+        ordered_normalized_windows: list[int] = []
+        if isinstance(normalized_window_months, list) and normalized_window_months:
+            ordered_normalized_windows = [int(value) for value in normalized_window_months]
+        elif isinstance(normalized_figures, dict) and normalized_figures:
+            ordered_normalized_windows = sorted(int(value) for value in normalized_figures.keys())
+        if (
+            isinstance(selected_normalized_window_months, int)
+            and selected_normalized_window_months not in ordered_normalized_windows
+        ):
+            ordered_normalized_windows.append(int(selected_normalized_window_months))
+        ordered_normalized_windows = sorted(set(ordered_normalized_windows))
+
+        selector_state_key = "normalized_holdings_selector_state"
+        plot_cache_key = "normalized_prepared_multi_window_plot"
+        plot_cache_sig_key = "normalized_prepared_plot_signature"
+        if isinstance(normalized_holdings_catalog, pd.DataFrame) and not normalized_holdings_catalog.empty:
+            fresh_catalog = normalized_holdings_catalog.copy()
+            fresh_catalog["instrument_id"] = fresh_catalog["instrument_id"].astype(str)
+            previous_selector_state = st.session_state.get(selector_state_key, pd.DataFrame())
+            previous_selected_map: dict[str, bool] = {}
+            if (
+                isinstance(previous_selector_state, pd.DataFrame)
+                and not previous_selector_state.empty
+                and "instrument_id" in previous_selector_state.columns
+                and "selected" in previous_selector_state.columns
+            ):
+                previous = previous_selector_state.copy()
+                previous["instrument_id"] = previous["instrument_id"].astype(str)
+                previous_selected_map = {
+                    str(row.instrument_id): bool(row.selected)
+                    for row in previous.loc[:, ["instrument_id", "selected"]].itertuples(index=False)
+                }
+            fresh_catalog["selected"] = fresh_catalog["instrument_id"].map(
+                lambda instrument_id: previous_selected_map.get(str(instrument_id), True)
+            ).astype(bool)
+            selector_state = fresh_catalog
+
+            preset_generate_requested = ""
+            selected_instrument_ids: list[str] = []
+            visible_count = len(selector_state)
+            selected_signature = ""
+            cached_normalized_figure = st.session_state.get(plot_cache_key)
+            cached_signature = str(st.session_state.get(plot_cache_sig_key, ""))
+            plots_ready = False
+            generate_plots = False
+            preset_cols = st.columns(2)
+            preset_generate_etf_under = preset_cols[0].button(
+                "Generate plots for ETFs under target",
+                key="normalized_preset_generate_etf_under",
+            )
+            preset_generate_non_etf_under = preset_cols[1].button(
+                "Generate plots for non-ETFs under target",
+                key="normalized_preset_generate_non_etf_under",
+            )
+            apply_lowpass_filter = st.checkbox(
+                "Apply low-pass Butterworth smoothing",
+                value=False,
+                key="normalized_apply_lowpass_filter",
+                help="Applies a gentle 2nd-order low-pass Butterworth filter to the normalized series before plotting.",
+            )
+            scipy_available = importlib.util.find_spec("scipy") is not None
+            if apply_lowpass_filter and not scipy_available:
+                st.warning(
+                    "Butterworth smoothing requires `scipy`. It has been added to `requirements.txt`; "
+                    "until that dependency is installed, the normalized series remain unsmoothed."
+                )
+            if preset_generate_etf_under:
+                st.session_state["normalized_holdings_type_filter"] = ["ETF"]
+                st.session_state["normalized_holdings_target_filter"] = ["Under target"]
+                st.session_state["normalized_holdings_threshold_filter"] = [
+                    "Above threshold",
+                    "At/below threshold",
+                ]
+                st.session_state["normalized_holdings_search"] = ""
+                preset_generate_requested = "ETF"
+            elif preset_generate_non_etf_under:
+                st.session_state["normalized_holdings_type_filter"] = ["Non-ETF"]
+                st.session_state["normalized_holdings_target_filter"] = ["Under target"]
+                st.session_state["normalized_holdings_threshold_filter"] = [
+                    "Above threshold",
+                    "At/below threshold",
+                ]
+                st.session_state["normalized_holdings_search"] = ""
+                preset_generate_requested = "Non-ETF"
+
+            with st.expander("Filters, holdings selection, and plot generation", expanded=False):
+                filter_cols = st.columns([1.2, 1.2, 1.2, 2.2])
+                type_filter = filter_cols[0].multiselect(
+                    "Holding type",
+                    options=["ETF", "Non-ETF"],
+                    default=["ETF", "Non-ETF"],
+                    key="normalized_holdings_type_filter",
+                )
+                target_filter = filter_cols[1].multiselect(
+                    "Target status",
+                    options=["Over target", "Under target", "At target"],
+                    default=["Over target", "Under target", "At target"],
+                    key="normalized_holdings_target_filter",
+                )
+                threshold_filter = filter_cols[2].multiselect(
+                    "Threshold status",
+                    options=["Above threshold", "At/below threshold"],
+                    default=["Above threshold", "At/below threshold"],
+                    key="normalized_holdings_threshold_filter",
+                )
+                search_term = filter_cols[3].text_input(
+                    "Search ticker or product",
+                    key="normalized_holdings_search",
+                ).strip().lower()
+
+                visible_mask = (
+                    selector_state["holding_type"].isin(type_filter)
+                    & selector_state["target_status"].isin(target_filter)
+                    & selector_state["threshold_status"].isin(threshold_filter)
+                )
+                if search_term != "":
+                    ticker_match = selector_state["ticker"].astype(str).str.lower().str.contains(search_term, na=False)
+                    product_match = selector_state["product"].astype(str).str.lower().str.contains(search_term, na=False)
+                    visible_mask = visible_mask & (ticker_match | product_match)
+
+                if preset_generate_requested != "":
+                    selector_state["selected"] = (
+                        selector_state["holding_type"].eq(preset_generate_requested)
+                        & selector_state["target_status"].eq("Under target")
+                    ).astype(bool)
+
+                action_cols = st.columns(6)
+                if action_cols[0].button("Select all", key="normalized_select_all"):
+                    selector_state.loc[visible_mask, "selected"] = True
+                if action_cols[1].button("Clear all", key="normalized_clear_all"):
+                    selector_state.loc[visible_mask, "selected"] = False
+                if action_cols[2].button("ETFs", key="normalized_select_etfs"):
+                    selector_state["selected"] = selector_state["holding_type"].eq("ETF")
+                if action_cols[3].button("Non-ETFs", key="normalized_select_non_etfs"):
+                    selector_state["selected"] = selector_state["holding_type"].eq("Non-ETF")
+                if action_cols[4].button("Over target", key="normalized_select_over_target"):
+                    selector_state["selected"] = selector_state["target_status"].eq("Over target")
+                if action_cols[5].button("Above threshold", key="normalized_select_above_threshold"):
+                    selector_state["selected"] = selector_state["threshold_status"].eq("Above threshold")
+
+                visible_catalog = selector_state.loc[visible_mask].copy()
+                visible_catalog = visible_catalog.loc[
+                    :,
+                    [
+                        "selected",
+                        "instrument_id",
+                        "ticker",
+                        "product",
+                        "holding_type",
+                        "target_status",
+                        "threshold_status",
+                        "value_eur",
+                        "target_per_holding_pct",
+                        "over_target_eur",
+                    ],
+                ]
+                edited_visible_catalog = st.data_editor(
+                    visible_catalog,
+                    key="normalized_holdings_data_editor",
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "selected": st.column_config.CheckboxColumn("plot", help="Include this holding in the normalized charts."),
+                        "instrument_id": st.column_config.TextColumn("instrument_id", disabled=True),
+                        "ticker": st.column_config.TextColumn("ticker", disabled=True),
+                        "product": st.column_config.TextColumn("product", disabled=True),
+                        "holding_type": st.column_config.TextColumn("type", disabled=True),
+                        "target_status": st.column_config.TextColumn("target", disabled=True),
+                        "threshold_status": st.column_config.TextColumn("threshold", disabled=True),
+                        "value_eur": st.column_config.NumberColumn("value_eur", format="%.2f", disabled=True),
+                        "target_per_holding_pct": st.column_config.NumberColumn("target_pct", format="%.2f", disabled=True),
+                        "over_target_eur": st.column_config.NumberColumn("over_target_eur", format="%.2f", disabled=True),
+                    },
+                )
+                if isinstance(edited_visible_catalog, pd.DataFrame) and not edited_visible_catalog.empty:
+                    edited_visible_catalog["instrument_id"] = edited_visible_catalog["instrument_id"].astype(str)
+                    edited_visible_catalog["selected"] = edited_visible_catalog["selected"].astype(bool)
+                    selection_updates = edited_visible_catalog.set_index("instrument_id")["selected"].astype(bool)
+                    update_mask = selector_state["instrument_id"].isin(selection_updates.index)
+                    selector_state.loc[update_mask, "selected"] = (
+                        selector_state.loc[update_mask, "instrument_id"].map(selection_updates).astype(bool).to_numpy()
+                    )
+
+                selector_state["selected"] = selector_state["selected"].astype(bool)
+                selected_instrument_ids = selector_state.loc[
+                    visible_mask & selector_state["selected"],
+                    "instrument_id",
+                ].astype(str).tolist()
+                visible_count = int(visible_mask.sum())
+                selected_signature = json.dumps(
+                    {
+                        "instrument_ids": selected_instrument_ids,
+                        "lookback_months": int(normalized_lookback_months),
+                        "window_months": ordered_normalized_windows,
+                        "apply_lowpass_filter": bool(apply_lowpass_filter),
+                    },
+                    sort_keys=True,
+                )
+                plots_ready = cached_normalized_figure is not None and cached_signature == selected_signature
+                generate_cols = st.columns([1.1, 2.2])
+                generate_plots = generate_cols[0].button(
+                    "Generate normalized plots",
+                    type="primary",
+                    key="normalized_generate_plots",
+                )
+
+            st.session_state[selector_state_key] = selector_state
+            selected_holdings_catalog = selector_state.loc[
+                selector_state["instrument_id"].isin(selected_instrument_ids)
+            ].copy()
+            selected_holding_types = set(selected_holdings_catalog.get("holding_type", pd.Series(dtype=str)).astype(str))
+            if selected_holding_types == {"ETF"}:
+                encoding_text = "Current subset uses a distinctive multi-color palette because all selected holdings are ETFs."
+            elif selected_holding_types == {"Non-ETF"}:
+                encoding_text = "Current subset uses a distinctive multi-color palette because all selected holdings are non-ETFs."
+            else:
+                encoding_text = (
+                    "Encoding: ETFs use blue/purple shades, non-ETFs use orange/red shades, over-target holdings are thicker, "
+                    "and holdings above the threshold are strongest."
+                )
+            smoothing_text = (
+                " Butterworth smoothing is enabled."
+                if apply_lowpass_filter and scipy_available
+                else (
+                    " Butterworth smoothing is selected but `scipy` is not installed yet."
+                    if apply_lowpass_filter and not scipy_available
+                    else ""
+                )
+            )
+            st.caption(
+                f"{len(selected_instrument_ids)} of {visible_count} filtered holdings selected "
+                f"({len(selector_state)} total holdings available). "
+                f"{encoding_text}{smoothing_text}"
+            )
+
+            if preset_generate_requested != "":
+                generate_plots = True
+            if generate_plots:
+                if not selected_instrument_ids:
+                    st.warning("Select at least one filtered holding to generate the normalized plots.")
+                else:
+                    selected_price_columns = [
+                        instrument_id
+                        for instrument_id in selected_instrument_ids
+                        if instrument_id in prices_eur_df.columns
+                    ]
+                    selected_prices_eur = prices_eur_df.loc[:, selected_price_columns].copy()
+                    prices_local_df = getattr(processed.get("timeseries"), "prices_local", pd.DataFrame())
+                    selected_prices_local = (
+                        prices_local_df.loc[:, selected_price_columns].copy()
+                        if isinstance(prices_local_df, pd.DataFrame) and not prices_local_df.empty
+                        else pd.DataFrame(index=selected_prices_eur.index)
+                    )
+                    selected_catalog = selector_state.loc[
+                        selector_state["instrument_id"].isin(selected_price_columns)
+                    ].copy()
+                    with st.spinner("Generating normalized plots for the selected holdings..."):
+                        prepared_figures = {
+                            int(window_months): build_normalized_median_figure(
+                                selected_prices_eur,
+                                prices_local=selected_prices_local,
+                                holdings_catalog=selected_catalog,
+                                lookback_months=int(normalized_lookback_months),
+                                median_window_months=int(window_months),
+                                apply_lowpass_filter=bool(apply_lowpass_filter),
+                            )
+                            for window_months in ordered_normalized_windows
+                        }
+                        prepared_multi_window_figure = build_normalized_median_window_switcher_figure(
+                            prepared_figures,
+                            default_window_months=(
+                                int(selected_normalized_window_months)
+                                if isinstance(selected_normalized_window_months, int)
+                                else None
+                            ),
+                        )
+                    st.session_state[plot_cache_key] = prepared_multi_window_figure
+                    st.session_state[plot_cache_sig_key] = selected_signature
+                    cached_normalized_figure = prepared_multi_window_figure
+                    plots_ready = True
+            elif not plots_ready and cached_signature != "":
+                st.info(
+                    "Selection or filters changed. Showing the previously generated plots until you click "
+                    "`Generate normalized plots` again."
+                )
+
+            active_normalized_figure = (
+                cached_normalized_figure
+                if plots_ready and cached_normalized_figure is not None
+                else normalized_multi_window_figure
+            )
+            if active_normalized_figure is not None:
+                plotly_chart_stretch(active_normalized_figure, key="normalized_median_chart")
+            else:
+                plotly_chart_stretch(processed.get("fig_normalized"), key="normalized_median_chart")
+        else:
+            plotly_chart_stretch(
+                normalized_multi_window_figure
+                if normalized_multi_window_figure is not None
+                else processed.get("fig_normalized"),
+                key="normalized_median_chart",
+            )
 
         st.subheader("Four tables")
         st.caption(
@@ -2622,19 +3137,23 @@ def render_main(*, logger: Any) -> None:
             "share, and lower-ranked holdings in the segment receive 0%."
         )
         combined_portfolio_value = value_from_summary(summary_df, "combined value")
-        target_etf_total_pct = (
-            value_from_summary(summary_df, "target ETF value") / combined_portfolio_value * 100.0
-            if np.isfinite(combined_portfolio_value) and combined_portfolio_value > 0.0
-            else float("nan")
-        )
-        target_non_etf_total_pct = (
-            value_from_summary(summary_df, "target non-ETF value") / combined_portfolio_value * 100.0
-            if np.isfinite(combined_portfolio_value) and combined_portfolio_value > 0.0
-            else float("nan")
-        )
         etf_table = tables_data.get("etf", pd.DataFrame())
         non_etf_table = tables_data.get("non_etf", pd.DataFrame())
         over_target_table = tables_data.get("over_target", pd.DataFrame())
+
+        def _segment_target_per_holding_pct(df: pd.DataFrame) -> float:
+            if not isinstance(df, pd.DataFrame) or df.empty or "target_per_holding_pct" not in df.columns:
+                return float("nan")
+            target_series = pd.to_numeric(df["target_per_holding_pct"], errors="coerce")
+            positive_targets = target_series[target_series > 0.0]
+            if not positive_targets.empty:
+                return float(positive_targets.max())
+            if target_series.notna().any():
+                return float(target_series.fillna(0.0).max())
+            return float("nan")
+
+        target_etf_per_holding_pct = _segment_target_per_holding_pct(etf_table)
+        target_non_etf_per_holding_pct = _segment_target_per_holding_pct(non_etf_table)
         tab1, tab2, tab3, tab4, tab5 = st.tabs(
             [
                 "ETFs characteristics",
@@ -2685,7 +3204,7 @@ def render_main(*, logger: Any) -> None:
                     holdings_df=etf_pie_df,
                     title="ETF holdings (% of ETF sleeve)",
                     total_portfolio_value_eur=combined_portfolio_value,
-                    target_total_pct=target_etf_total_pct,
+                    target_per_holding_pct=target_etf_per_holding_pct,
                 )
                 plotly_chart_stretch(etf_pie)
             with pie_right:
@@ -2693,7 +3212,7 @@ def render_main(*, logger: Any) -> None:
                     holdings_df=non_etf_pie_df,
                     title="Non-ETF holdings (% of non-ETF sleeve)",
                     total_portfolio_value_eur=combined_portfolio_value,
-                    target_total_pct=target_non_etf_total_pct,
+                    target_per_holding_pct=target_non_etf_per_holding_pct,
                 )
                 plotly_chart_stretch(non_etf_pie)
             threshold_value = _to_float(
@@ -2928,13 +3447,16 @@ def render_main(*, logger: Any) -> None:
                 st.info("No next-step plan available.")
 
 
-def plotly_chart_stretch(fig: Any) -> None:
+def plotly_chart_stretch(fig: Any, *, key: str | None = None) -> None:
     if fig is None:
         return
     try:
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", key=key)
     except TypeError:
-        st.plotly_chart(fig)
+        if key is None:
+            st.plotly_chart(fig)
+        else:
+            st.plotly_chart(fig, key=key)
 
 
 def build_totals_check_text(

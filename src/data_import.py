@@ -1366,6 +1366,34 @@ def validate_critical_columns(
         mask=transactions["quantity"].isna(),
         columns=["datetime", "product", "isin", "quantity", "total_eur", "type"],
     )
+
+    tx_dates = pd.to_datetime(transactions.get("datetime"), errors="coerce").dropna()
+    account_dates = pd.to_datetime(account.get("datetime"), errors="coerce").dropna()
+    if not tx_dates.empty and not account_dates.empty:
+        tx_start = pd.Timestamp(tx_dates.min()).normalize()
+        account_start = pd.Timestamp(account_dates.min()).normalize()
+        if account_start > tx_start:
+            missing_tx_count = int((pd.to_datetime(transactions["datetime"], errors="coerce") < account_start).sum())
+            warnings.append(
+                "Account history starts after transaction history; external deposits and cash before the "
+                f"first account row are unavailable. First transaction date: {tx_start:%Y-%m-%d}. "
+                f"First account date: {account_start:%Y-%m-%d}."
+            )
+            issues.append(
+                {
+                    "label": "Account history starts after transaction history",
+                    "count": missing_tx_count,
+                    "examples": pd.DataFrame(
+                        [
+                            {
+                                "first_transaction_date": tx_start.strftime("%Y-%m-%d"),
+                                "first_account_date": account_start.strftime("%Y-%m-%d"),
+                                "transactions_before_account_start": missing_tx_count,
+                            }
+                        ]
+                    ),
+                }
+            )
     return warnings, issues
 
 

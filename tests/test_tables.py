@@ -96,6 +96,7 @@ def test_build_four_tables_uses_desired_holding_counts_for_targets() -> None:
                 "product": "ETF One",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 200.0,
@@ -106,6 +107,7 @@ def test_build_four_tables_uses_desired_holding_counts_for_targets() -> None:
                 "product": "Stock One",
                 "isin": "US0000000001",
                 "ticker": "STK1",
+                "currency": "EUR",
                 "is_etf": False,
                 "quantity": 1.0,
                 "value_eur": 100.0,
@@ -153,6 +155,7 @@ def test_build_four_tables_zeroes_target_for_holdings_beyond_desired_count() -> 
                 "product": "ETF One",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 400.0,
@@ -163,6 +166,7 @@ def test_build_four_tables_zeroes_target_for_holdings_beyond_desired_count() -> 
                 "product": "ETF Two",
                 "isin": "IE00TEST00002",
                 "ticker": "ETF2",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 300.0,
@@ -173,6 +177,7 @@ def test_build_four_tables_zeroes_target_for_holdings_beyond_desired_count() -> 
                 "product": "ETF Three",
                 "isin": "IE00TEST00003",
                 "ticker": "ETF3",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 200.0,
@@ -183,6 +188,7 @@ def test_build_four_tables_zeroes_target_for_holdings_beyond_desired_count() -> 
                 "product": "ETF Four",
                 "isin": "IE00TEST00004",
                 "ticker": "ETF4",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 100.0,
@@ -224,6 +230,7 @@ def test_unify_holding_product_names_reports_and_applies_first_product() -> None
                 "product": "ETF One Short",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 100.0,
@@ -234,6 +241,7 @@ def test_unify_holding_product_names_reports_and_applies_first_product() -> None
                 "product": "ETF One Long Name",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 2.0,
                 "value_eur": 200.0,
@@ -266,6 +274,7 @@ def test_build_four_tables_aggregates_after_product_name_unification() -> None:
                 "product": "ETF One Short",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 1.0,
                 "value_eur": 100.0,
@@ -276,6 +285,7 @@ def test_build_four_tables_aggregates_after_product_name_unification() -> None:
                 "product": "ETF One Long Name",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 2.0,
                 "value_eur": 200.0,
@@ -318,6 +328,7 @@ def test_build_latest_valued_holdings_uses_latest_price_times_quantity() -> None
                 "product": "ETF One",
                 "isin": "IE00TEST00001",
                 "ticker": "ETF1",
+                "currency": "EUR",
                 "is_etf": True,
                 "quantity": 2.0,
                 "value_eur": -150.0,
@@ -334,3 +345,59 @@ def test_build_latest_valued_holdings_uses_latest_price_times_quantity() -> None
     assert row["quantity"] == 3.0
     assert row["last_px_eur"] == 125.0
     assert row["value_eur"] == 375.0
+
+
+def test_build_latest_valued_holdings_adds_positions_missing_from_snapshot() -> None:
+    holdings = pd.DataFrame(
+        [
+            {
+                "account_label": "Dataset A",
+                "instrument_id": "ETF1",
+                "product": "ETF One",
+                "isin": "IE00TEST00001",
+                "ticker": "ETF1",
+                "currency": "EUR",
+                "is_etf": True,
+                "quantity": 2.0,
+                "value_eur": 150.0,
+            }
+        ]
+    )
+    positions = pd.DataFrame({"ETF1": [3.0], "STOCK2": [4.0]}, index=[pd.Timestamp("2026-01-01")])
+    prices = pd.DataFrame({"ETF1": [125.0], "STOCK2": [20.0]}, index=[pd.Timestamp("2026-01-01")])
+    instruments = pd.DataFrame(
+        [
+            {
+                "instrument_id": "ETF1",
+                "product": "ETF One",
+                "isin": "IE00TEST00001",
+                "ticker": "ETF1",
+                "currency": "EUR",
+                "is_etf": True,
+            },
+            {
+                "instrument_id": "STOCK2",
+                "product": "Stock Two",
+                "isin": "US00TEST00002",
+                "ticker": "STK2",
+                "currency": "EUR",
+                "is_etf": False,
+            },
+        ]
+    )
+
+    out = build_latest_valued_holdings(
+        holdings,
+        positions=positions,
+        prices_eur=prices,
+        instruments=instruments,
+    )
+
+    assert set(out["instrument_id"]) == {"ETF1", "STOCK2"}
+    stock_row = out.loc[out["instrument_id"].eq("STOCK2")].iloc[0]
+    assert stock_row["product"] == "Stock Two"
+    assert stock_row["ticker"] == "STK2"
+    assert bool(stock_row["is_etf"]) is False
+    assert stock_row["quantity"] == 4.0
+    assert stock_row["last_px_eur"] == 20.0
+    assert stock_row["value_eur"] == 80.0

@@ -99,14 +99,22 @@ def build_performance_dashboard(
     )
 
     summary_row = all_time_df.iloc[0] if not all_time_df.empty else pd.Series(dtype="float64")
+    latest_metrics = metrics.iloc[-1] if not metrics.empty else pd.Series(dtype="float64")
+    latest_total_deposits = _to_float(latest_metrics.get("total_deposits", np.nan), np.nan)
+    latest_portfolio_value = _to_float(latest_metrics.get("portfolio_value", np.nan), np.nan)
+    all_time_profit_eur = (
+        latest_portfolio_value - latest_total_deposits
+        if np.isfinite(latest_portfolio_value) and np.isfinite(latest_total_deposits)
+        else np.nan
+    )
     summary = {
         "all_time_twr_pct": _to_float(summary_row.get("twr_ex_flows_pct", np.nan), np.nan),
         "all_time_irr_pct": _to_float(summary_row.get("irr_annualized_pct", np.nan), np.nan),
         "all_time_xirr_pct": _to_float(summary_row.get("xirr_pct", np.nan), np.nan),
         "all_time_start_value_eur": _to_float(summary_row.get("start_value_eur", np.nan), np.nan),
         "all_time_end_value_eur": _to_float(summary_row.get("end_value_eur", np.nan), np.nan),
-        "all_time_net_deposit_eur": _to_float(summary_row.get("net_deposited_eur", np.nan), np.nan),
-        "all_time_investment_pnl_eur": _to_float(summary_row.get("investment_pnl_eur", np.nan), np.nan),
+        "all_time_net_deposit_eur": latest_total_deposits,
+        "all_time_investment_pnl_eur": all_time_profit_eur,
     }
     return {
         "all_time_df": all_time_df,

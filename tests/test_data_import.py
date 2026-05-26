@@ -142,7 +142,7 @@ def test_account_normalization_normalizes_fx_scale_tenths_in_order_rows() -> Non
     csv_text = """Date,Time,Description,FX,Change,,Balance,,Order Id
 01-01-2026,10:00,Valuta Debitering,"11,738","-117,38",USD,"0,00",USD,order-1
 01-01-2026,10:00,Valuta Creditering,,"100,00",EUR,"100,00",EUR,order-1
-01-01-2026,10:00,Koop 1 @ 117,38 USD,,"-117,38",USD,"-117,38",USD,order-1
+01-01-2026,10:00,"Koop 1 @ 117,38 USD",,"-117,38",USD,"-117,38",USD,order-1
 """
     raw = pd.read_csv(io.StringIO(csv_text), dtype=str)
     warnings: list[str] = []
@@ -273,6 +273,55 @@ def test_missing_ticker_error_contains_product_name() -> None:
         assert "DEUTSCHE POST AG" in text
         assert "DE0005552004" in text
         assert "ticker_classification_complete.csv" in text
+
+
+def test_validate_critical_columns_warns_when_account_history_starts_after_transactions() -> None:
+    tx = pd.DataFrame(
+        [
+            {
+                "datetime": pd.Timestamp("2026-01-01 10:00:00"),
+                "product": "TEST",
+                "isin": "IE00TEST00001",
+                "quantity": 1.0,
+                "total_eur": -100.0,
+                "description": "Buy",
+                "type": "trade",
+            }
+        ]
+    )
+    pf = pd.DataFrame(
+        [
+            {
+                "product": "TEST",
+                "isin": "IE00TEST00001",
+                "quantity": 1.0,
+                "price": 100.0,
+                "value_eur": 100.0,
+                "currency": "EUR",
+                "is_cash_like": False,
+            }
+        ]
+    )
+    acc = pd.DataFrame(
+        [
+            {
+                "datetime": pd.Timestamp("2026-01-03 09:00:00"),
+                "description": "flatex Storting",
+                "type": "external_deposit",
+                "currency": "EUR",
+                "raw_change": 500.0,
+                "raw_balance": 500.0,
+                "fx_rate": 1.0,
+                "change_eur": 500.0,
+                "balance_eur": 500.0,
+            }
+        ]
+    )
+
+    warnings, issues = validate_critical_columns(transactions=tx, portfolio=pf, account=acc)
+
+    assert any("Account history starts after transaction history" in warning for warning in warnings)
+    assert any(issue["label"] == "Account history starts after transaction history" for issue in issues)
 
 
 def test_is_not_etf_explicit_override() -> None:

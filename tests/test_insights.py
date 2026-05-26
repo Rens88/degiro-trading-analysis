@@ -119,6 +119,10 @@ def test_performance_dashboard_has_all_time_yearly_quarterly() -> None:
     assert not out["yearly_df"].empty
     assert not out["quarterly_df"].empty
     assert "xirr_pct" in out["all_time_df"].columns
+    summary = out["summary"]
+    expected_profit = float(metrics.iloc[-1]["portfolio_value"] - metrics.iloc[-1]["total_deposits"])
+    assert float(summary["all_time_net_deposit_eur"]) == float(metrics.iloc[-1]["total_deposits"])
+    assert float(summary["all_time_investment_pnl_eur"]) == expected_profit
 
 
 def test_spread_analysis_outputs_style_and_next_steps() -> None:
